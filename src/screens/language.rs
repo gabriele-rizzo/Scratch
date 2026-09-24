@@ -99,7 +99,7 @@ impl Language {
             .collect()
     }
 
-    fn select(&self) -> Result<ScreenAction> {
+    fn select(&mut self) -> Result<ScreenAction> {
         let Some(&index) = self.matches().get(self.selected) else {
             return Ok(ScreenAction::None);
         };
@@ -109,6 +109,11 @@ impl Language {
         };
 
         let editor = Editor::new(&RUNNERS[index], binary.clone())?;
+
+        // Start from the full list when coming back from the editor.
+        self.input.clear();
+        self.selected = 0;
+
         Ok(ScreenAction::Push(Box::new(editor)))
     }
 
@@ -276,6 +281,9 @@ impl Screen for Language {
         if let Some(action) = utils::handle_exit_input(&event) {
             return Ok(action);
         }
+
+        // Results may have arrived since the last draw.
+        self.poll_detection();
 
         if self.checking() {
             return Ok(ScreenAction::None);

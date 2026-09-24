@@ -10,6 +10,9 @@ pub use command_bar::*;
 mod toast;
 pub use toast::*;
 
+mod scroll;
+pub use scroll::*;
+
 use std::time::{Duration, Instant};
 
 use ratatui::{

@@ -8,6 +8,7 @@ use ratatui::{
 use super::{ERROR, SUCCESS, TEXT};
 
 const TOAST_DURATION: Duration = Duration::from_secs(3);
+const ERROR_TOAST_DURATION: Duration = Duration::from_secs(6);
 
 #[derive(Clone, Copy)]
 pub enum ToastKind {
@@ -40,7 +41,12 @@ impl Toast {
     }
 
     pub fn is_visible(&self) -> bool {
-        self.shown.elapsed() < TOAST_DURATION
+        let duration = match self.kind {
+            ToastKind::Error => ERROR_TOAST_DURATION,
+            ToastKind::Success => TOAST_DURATION,
+        };
+
+        self.shown.elapsed() < duration
     }
 
     pub fn line(&self) -> Line<'_> {

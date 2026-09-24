@@ -41,8 +41,17 @@ impl CommandBar {
         }
     }
 
+    /// The typed text, ignoring a leading `:` (the prompt already shows one).
+    fn text(&self) -> &str {
+        self.input
+            .value()
+            .trim_start()
+            .trim_start_matches(':')
+            .trim_start()
+    }
+
     fn query(&self) -> (&str, &str) {
-        let value = self.input.value().trim_start();
+        let value = self.text();
         match value.split_once(char::is_whitespace) {
             Some((name, args)) => (name, args.trim()),
             None => (value, ""),
@@ -51,11 +60,7 @@ impl CommandBar {
 
     fn suggestions(&self) -> Vec<&'static CommandSpec> {
         let (name, _) = self.query();
-        let typing_args = self
-            .input
-            .value()
-            .trim_start()
-            .contains(char::is_whitespace);
+        let typing_args = self.text().contains(char::is_whitespace);
 
         self.specs
             .iter()
@@ -95,10 +100,8 @@ impl CommandBar {
             KeyCode::Enter => {
                 let (name, args) = self.query();
 
-                if name.is_empty() {
-                    return CommandEvent::Cancel;
-                }
-
+                // An exact name wins; otherwise run the highlighted suggestion, which is
+                // also how commands picked with ↑↓ (and nothing typed) get run.
                 let spec = self
                     .specs
                     .iter()
@@ -110,6 +113,7 @@ impl CommandBar {
                         name: spec.name,
                         args: args.to_string(),
                     },
+                    None if name.is_empty() => CommandEvent::Cancel,
                     None => CommandEvent::Unknown(name.to_string()),
                 };
             }
