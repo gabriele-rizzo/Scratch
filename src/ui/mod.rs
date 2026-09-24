@@ -13,6 +13,9 @@ pub use toast::*;
 mod scroll;
 pub use scroll::*;
 
+mod confirm;
+pub use confirm::*;
+
 use std::time::{Duration, Instant};
 
 use ratatui::{
@@ -21,7 +24,7 @@ use ratatui::{
 };
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+pub const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 
 /// Spinner frame for an animation that began at `since`.
 pub fn spinner(since: Instant) -> &'static str {

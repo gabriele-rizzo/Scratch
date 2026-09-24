@@ -25,6 +25,7 @@ const COMMANDS: &[CommandSpec] = &[CommandSpec {
     name: "exit",
     args: "",
     description: "Quit Scratch",
+    keys: "ctrl+c",
 }];
 
 enum Status {
@@ -84,18 +85,37 @@ impl Language {
         }
     }
 
-    fn is_visible(&self, runner: &Runner) -> bool {
-        runner
-            .name
-            .to_lowercase()
-            .contains(&self.input.value().trim().to_lowercase())
+    /// How well `runner` matches the input: exact, then prefix, then substring.
+    /// `None` hides it.
+    fn rank(&self, runner: &Runner) -> Option<u8> {
+        let query = self.input.value().trim().to_lowercase();
+        let name = runner.name.to_lowercase();
+
+        if name == query {
+            Some(0)
+        } else if name.starts_with(&query) {
+            Some(1)
+        } else if name.contains(&query) {
+            Some(2)
+        } else {
+            None
+        }
     }
 
-    /// Indices of runners that are available and match the input.
+    /// Indices of runners that match the input, best matches first.
+    fn visible(&self) -> Vec<usize> {
+        let mut visible: Vec<(u8, usize)> = (0..RUNNERS.len())
+            .filter_map(|index| Some((self.rank(&RUNNERS[index])?, index)))
+            .collect();
+        visible.sort();
+        visible.into_iter().map(|(_, index)| index).collect()
+    }
+
+    /// The visible runners that are available, in display order.
     fn matches(&self) -> Vec<usize> {
-        (0..RUNNERS.len())
+        self.visible()
+            .into_iter()
             .filter(|&index| matches!(self.statuses[index], Status::Available(_)))
-            .filter(|&index| self.is_visible(&RUNNERS[index]))
             .collect()
     }
 
@@ -137,9 +157,7 @@ impl Language {
     }
 
     fn draw_list(&self, frame: &mut Frame, area: Rect) {
-        let visible: Vec<usize> = (0..RUNNERS.len())
-            .filter(|&index| self.is_visible(&RUNNERS[index]))
-            .collect();
+        let visible = self.visible();
 
         if visible.is_empty() {
             let empty = Line::from(vec![
@@ -254,9 +272,12 @@ impl Language {
 }
 
 impl Screen for Language {
-    fn draw(&mut self, frame: &mut Frame) {
+    fn update(&mut self) -> Result<ScreenAction> {
         self.poll_detection();
+        Ok(ScreenAction::None)
+    }
 
+    fn draw(&mut self, frame: &mut Frame) {
         let matches = self.matches().len();
         self.selected = self.selected.min(matches.saturating_sub(1));
 

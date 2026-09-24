@@ -7,5 +7,8 @@ mod ui;
 mod utils;
 
 fn main() -> Result<()> {
-    App::new(screens::Language::new())?.run()
+    // Ticks at the spinner's frame rate, which is also plenty for live output.
+    App::new(screens::Language::new())?
+        .with_tick_rate(ui::SPINNER_INTERVAL)
+        .run()
 }

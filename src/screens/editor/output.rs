@@ -1,5 +1,6 @@
 use std::{borrow::Cow, path::Path};
 
+use ansi_to_tui::IntoText;
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
@@ -13,13 +14,17 @@ use ratatui::{
 };
 
 use crate::{
-    runners::{Process, RunStatus, Stream},
+    runners::{Process, RunStatus},
     ui::{self, ACCENT, ERROR, MUTED, SUBTLE, SUCCESS, Scroll, TEXT},
 };
 
 enum Run {
     /// `workdir` is hidden from output so paths read as `main.<ext>`.
-    Started { process: Process, workdir: String },
+    Started {
+        process: Process,
+        workdir: String,
+        rendered: Vec<Line<'static>>,
+    },
     /// The program couldn't be started at all.
     Failed { title: String, detail: String },
 }
@@ -37,6 +42,7 @@ impl Output {
         Self::new(Run::Started {
             process,
             workdir: format!("{}/", workdir.display()),
+            rendered: Vec::new(),
         })
     }
 
@@ -60,8 +66,16 @@ impl Output {
     }
 
     pub fn poll(&mut self) {
-        if let Run::Started { process, .. } = &mut self.run {
+        if let Run::Started {
+            process,
+            workdir,
+            rendered,
+        } = &mut self.run
+        {
             process.poll();
+
+            let new = &process.lines[rendered.len()..];
+            rendered.extend(new.iter().map(|raw| render_line(raw, workdir)));
         }
     }
 
@@ -103,57 +117,57 @@ impl Output {
         }
     }
 
-    fn lines(run: &Run) -> Vec<Line<'_>> {
-        let (process, workdir) = match run {
-            Run::Started { process, workdir } => (process, workdir),
+    /// Output lines, parsed once as they arrive.
+    fn rendered(&self) -> &[Line<'static>] {
+        match &self.run {
+            Run::Started { rendered, .. } => rendered,
+            Run::Failed { .. } => &[],
+        }
+    }
+
+    /// Lines shown after the program's output: a placeholder, the exit summary, or
+    /// the reason the program couldn't start.
+    fn trailer(&self) -> Vec<Line<'static>> {
+        let process = match &self.run {
+            Run::Started { process, .. } => process,
             Run::Failed { title, detail } => {
                 return vec![
                     Line::from(vec![
                         Span::styled("▎ ", Style::new().fg(ERROR)),
                         Span::styled(
-                            title.as_str(),
+                            title.clone(),
                             Style::new().fg(ERROR).add_modifier(Modifier::BOLD),
                         ),
                     ]),
                     Line::default(),
-                    Line::from(Span::styled(detail.as_str(), Style::new().fg(SUBTLE))),
+                    Line::from(Span::styled(detail.clone(), Style::new().fg(SUBTLE))),
                 ];
             }
         };
 
-        let mut lines: Vec<Line> = process
-            .lines
-            .iter()
-            .map(|(stream, text)| line(*stream, text, workdir))
-            .collect();
+        let italic = Style::new().add_modifier(Modifier::ITALIC);
+        let has_output = !process.lines.is_empty();
 
         match &process.status {
-            RunStatus::Running if lines.is_empty() => lines.push(Line::from(Span::styled(
-                "waiting for output…",
-                Style::new().fg(MUTED).add_modifier(Modifier::ITALIC),
-            ))),
-            RunStatus::Running => {}
+            RunStatus::Running if has_output => vec![],
+            RunStatus::Running => vec![Line::styled("waiting for output…", italic.fg(MUTED))],
             RunStatus::Exited(status, _) => {
-                if !lines.is_empty() {
-                    lines.push(Line::default());
-                }
-
                 let summary = match status.code() {
-                    Some(0) if process.lines.is_empty() => {
-                        Span::styled("Finished with no output", Style::new().fg(MUTED))
+                    Some(0) if has_output => Line::styled("Finished", italic.fg(MUTED)),
+                    Some(0) => Line::styled("Finished with no output", italic.fg(MUTED)),
+                    Some(code) => {
+                        Line::styled(format!("Process exited with code {code}"), italic.fg(ERROR))
                     }
-                    Some(0) => Span::styled("Finished", Style::new().fg(MUTED)),
-                    Some(code) => Span::styled(
-                        format!("Process exited with code {code}"),
-                        Style::new().fg(ERROR),
-                    ),
-                    None => Span::styled("Process was killed", Style::new().fg(ERROR)),
+                    None => Line::styled("Process was killed", italic.fg(ERROR)),
                 };
-                lines.push(Line::from(summary).style(Style::new().add_modifier(Modifier::ITALIC)));
+
+                if has_output {
+                    vec![Line::default(), summary]
+                } else {
+                    vec![summary]
+                }
             }
         }
-
-        lines
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -170,8 +184,8 @@ impl Output {
             .title_top(self.status().right_aligned());
 
         let inner = block.inner(area);
-        let lines = Self::lines(&self.run);
-        let total = lines.len();
+        let trailer = self.trailer();
+        let total = self.rendered().len() + trailer.len();
         let viewport = inner.height as usize;
         let offset = self.scroll.update(total, viewport);
 
@@ -188,9 +202,16 @@ impl Output {
             block
         };
 
-        let mut paragraph = Paragraph::new(lines)
-            .block(block)
-            .scroll((offset.min(u16::MAX as usize) as u16, 0));
+        // Only the visible lines are cloned, however long the output gets.
+        let lines: Vec<Line> = self
+            .rendered()
+            .iter()
+            .cloned()
+            .chain(trailer)
+            .skip(offset)
+            .take(viewport)
+            .collect();
+        let mut paragraph = Paragraph::new(lines).block(block);
 
         // Errors are only a few lines, so wrapping them can't throw off the scroll math.
         if let Run::Failed { .. } = self.run {
@@ -219,32 +240,29 @@ impl Output {
     }
 }
 
-/// Styles one line of program output. stderr gets a red gutter, and compiler-style
-/// `error`/`warning` headings are emphasized.
-fn line<'a>(stream: Stream, text: &'a str, workdir: &str) -> Line<'a> {
-    let text: Cow<str> = if text.contains(workdir) {
-        Cow::Owned(text.replace(workdir, ""))
+/// Parses one line of program output, keeping the program's own ANSI colors. Plain
+/// compiler-style `error`/`warning` lines are emphasized.
+fn render_line(raw: &str, workdir: &str) -> Line<'static> {
+    let raw: Cow<str> = if raw.contains(workdir) {
+        Cow::Owned(raw.replace(workdir, ""))
     } else {
-        Cow::Borrowed(text)
+        Cow::Borrowed(raw)
     };
 
-    let (gutter, style) = match stream {
-        Stream::Stdout => ("  ", Style::new().fg(TEXT)),
-        Stream::Stderr => {
-            let trimmed = text.trim_start();
-            let style = if trimmed.starts_with("error") || trimmed.contains("Error:") {
-                Style::new().fg(ERROR).add_modifier(Modifier::BOLD)
-            } else if trimmed.starts_with("warning") {
-                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::new().fg(SUBTLE)
-            };
-            ("▎ ", style)
-        }
+    if raw.contains('\x1b')
+        && let Ok(text) = raw.as_bytes().into_text()
+    {
+        return text.lines.into_iter().next().unwrap_or_default();
+    }
+
+    let trimmed = raw.trim_start();
+    let style = if trimmed.starts_with("error") || trimmed.contains("Error:") {
+        Style::new().fg(ERROR).add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("warning") {
+        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(TEXT)
     };
 
-    Line::from(vec![
-        Span::styled(gutter, Style::new().fg(ERROR)),
-        Span::styled(text, style),
-    ])
+    Line::styled(raw.into_owned(), style)
 }

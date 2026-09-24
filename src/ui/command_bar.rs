@@ -16,6 +16,8 @@ pub struct CommandSpec {
     /// Argument hint, e.g. `[path]`. Empty when the command takes none.
     pub args: &'static str,
     pub description: &'static str,
+    /// Keyboard shortcut for the command, if any, e.g. `ctrl+r`.
+    pub keys: &'static str,
 }
 
 pub enum CommandEvent {
@@ -162,16 +164,29 @@ impl CommandBar {
             .max()
             .unwrap_or(0);
 
+        // Borders and the highlight symbol take 4 columns.
+        let row_width = popup.width.saturating_sub(4) as usize;
+
         let items: Vec<ListItem> = suggestions
             .iter()
             .map(|spec| {
                 let padding = name_width - spec.name.len() - spec.args.len();
-                ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(spec.name, Style::new().fg(TEXT).bold()),
                     Span::styled(format!(" {}", spec.args), Style::new().fg(MUTED)),
                     Span::raw(" ".repeat(padding + 2)),
                     Span::styled(spec.description, Style::new().fg(SUBTLE)),
-                ]))
+                ];
+
+                // Right-align the shortcut when it fits.
+                let used: usize = spans.iter().map(Span::width).sum();
+                let keys = Span::raw(spec.keys).width();
+                if !spec.keys.is_empty() && used + keys + 2 <= row_width {
+                    spans.push(Span::raw(" ".repeat(row_width - used - keys - 1)));
+                    spans.push(Span::styled(spec.keys, Style::new().fg(MUTED)));
+                }
+
+                ListItem::new(Line::from(spans))
             })
             .collect();
 

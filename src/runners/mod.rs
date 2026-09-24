@@ -32,12 +32,7 @@ pub const RUNNERS: &[Runner] = &[
         syntax: "python",
         extension: "py",
         binaries: &["python3", "python"],
-        command: |binary, file| {
-            let mut command = interpret(binary, file);
-            // Keeps stdout and stderr in order when piped.
-            command.env("PYTHONUNBUFFERED", "1");
-            command
-        },
+        command: interpret,
     },
     Runner {
         name: "JavaScript",
