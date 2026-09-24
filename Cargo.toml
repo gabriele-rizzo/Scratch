@@ -1,0 +1,11 @@
+[package]
+name = "scratch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+tuimon = { git = "https://github.com/gabriele-rizzo/Tuimon.git", version = "0.1.0" }
+ratatui-code-editor = { version = "0.0.6", features = ["crossterm"] }
