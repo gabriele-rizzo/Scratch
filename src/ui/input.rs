@@ -55,6 +55,14 @@ impl Input {
             .map_or(self.value.len(), |(index, _)| index)
     }
 
+    /// Inserts `text` at the cursor, dropping control characters such as line breaks.
+    pub fn insert(&mut self, text: &str) {
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        let index = self.byte_index(self.cursor);
+        self.value.insert_str(index, &text);
+        self.cursor += text.chars().count();
+    }
+
     /// Applies an editing key. Returns whether the value changed.
     pub fn handle(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -134,5 +142,98 @@ impl Input {
             let x = inner.x + prompt_width + self.cursor_width();
             frame.set_cursor_position(Position::new(x.min(inner.right()), inner.y));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn typed(text: &str) -> Input {
+        let mut input = Input::default();
+        for c in text.chars() {
+            input.handle(key(KeyCode::Char(c)));
+        }
+        input
+    }
+
+    #[test]
+    fn typing_inserts_at_the_cursor() {
+        let mut input = typed("hllo");
+        input.handle(key(KeyCode::Home));
+        input.handle(key(KeyCode::Right));
+        input.handle(key(KeyCode::Char('e')));
+        assert_eq!(input.value(), "hello");
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_around_the_cursor() {
+        let mut input = typed("abcd");
+        input.handle(key(KeyCode::Left));
+        assert!(input.handle(key(KeyCode::Backspace)));
+        assert!(input.handle(key(KeyCode::Delete)));
+        assert_eq!(input.value(), "ab");
+
+        // Nothing to delete past the end.
+        assert!(!input.handle(key(KeyCode::Delete)));
+    }
+
+    #[test]
+    fn edits_multibyte_characters_by_char() {
+        let mut input = typed("héllo");
+        input.handle(key(KeyCode::Home));
+        input.handle(key(KeyCode::Right));
+        input.handle(key(KeyCode::Right));
+        input.handle(key(KeyCode::Backspace));
+        assert_eq!(input.value(), "hllo");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_previous_word() {
+        let mut input = typed("save  some/path");
+        input.handle(ctrl('w'));
+        assert_eq!(input.value(), "save  ");
+        input.handle(ctrl('w'));
+        assert_eq!(input.value(), "");
+    }
+
+    #[test]
+    fn ctrl_u_deletes_up_to_the_cursor() {
+        let mut input = typed("hello world");
+        for _ in 0..5 {
+            input.handle(key(KeyCode::Left));
+        }
+        input.handle(ctrl('u'));
+        assert_eq!(input.value(), "world");
+    }
+
+    #[test]
+    fn ctrl_letters_are_not_typed() {
+        let mut input = Input::default();
+        assert!(!input.handle(ctrl('r')));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn insert_drops_control_characters() {
+        let mut input = typed("ab");
+        input.handle(key(KeyCode::Left));
+        input.insert("x\ty\n");
+        assert_eq!(input.value(), "axyb");
+        assert_eq!(input.cursor_width(), 3);
+    }
+
+    #[test]
+    fn cursor_width_counts_display_columns() {
+        let input = typed("日本");
+        assert_eq!(input.cursor_width(), 4);
     }
 }

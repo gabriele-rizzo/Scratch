@@ -160,3 +160,118 @@ mod macos {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = env::temp_dir().join(format!("scratch-test-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn file(&self, name: &str, executable: bool) -> PathBuf {
+            let path = self.0.join(name);
+            fs::write(&path, "#!/bin/sh\n").unwrap();
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if executable { 0o755 } else { 0o644 };
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn found(detection: Detection) -> PathBuf {
+        match detection {
+            Detection::Found(path) => path,
+            _ => panic!("expected a binary to be found"),
+        }
+    }
+
+    #[test]
+    fn finds_an_executable_in_path() {
+        let dir = TempDir::new("finds");
+        let node = dir.file("node", true);
+        assert_eq!(
+            found(detect_runner(std::slice::from_ref(&dir.0), &["node"])),
+            node
+        );
+    }
+
+    #[test]
+    fn reports_missing_binaries() {
+        let dir = TempDir::new("missing");
+        assert!(matches!(
+            detect_runner(std::slice::from_ref(&dir.0), &["node"]),
+            Detection::Missing
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_files_that_are_not_executable() {
+        let dir = TempDir::new("not-executable");
+        dir.file("node", false);
+        assert!(matches!(
+            detect_runner(std::slice::from_ref(&dir.0), &["node"]),
+            Detection::Missing
+        ));
+    }
+
+    #[test]
+    fn prefers_binaries_in_listed_order() {
+        let dir = TempDir::new("order");
+        dir.file("bun", true);
+        let node = dir.file("node", true);
+        assert_eq!(
+            found(detect_runner(
+                std::slice::from_ref(&dir.0),
+                &["node", "bun"]
+            )),
+            node
+        );
+    }
+
+    #[test]
+    fn earlier_path_entries_win() {
+        let first = TempDir::new("first");
+        let second = TempDir::new("second");
+        second.file("node", true);
+        let winner = first.file("node", true);
+        let dirs = [first.0.clone(), second.0.clone()];
+        assert_eq!(found(detect_runner(&dirs, &["node"])), winner);
+    }
+
+    #[test]
+    fn ignores_directories_named_like_binaries() {
+        let dir = TempDir::new("directory");
+        fs::create_dir(dir.0.join("node")).unwrap();
+        assert!(matches!(
+            detect_runner(std::slice::from_ref(&dir.0), &["node"]),
+            Detection::Missing
+        ));
+    }
+
+    #[test]
+    fn only_usr_bin_can_be_a_placeholder() {
+        let dir = TempDir::new("placeholder");
+        let java = dir.file("java", true);
+        assert_eq!(placeholder_hint(&java), None);
+    }
+}

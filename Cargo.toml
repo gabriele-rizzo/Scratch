@@ -10,6 +10,7 @@ ratatui = "0.30.2"
 tuimon = { git = "https://github.com/gabriele-rizzo/Tuimon.git", version = "0.1.0" }
 ratatui-code-editor = { version = "0.0.6", features = ["crossterm"] }
 ansi-to-tui = "8.0.1"
+unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

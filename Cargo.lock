@@ -1487,6 +1487,7 @@ dependencies = [
  "ratatui",
  "ratatui-code-editor",
  "tuimon",
+ "unicode-width",
 ]
 
 [[package]]

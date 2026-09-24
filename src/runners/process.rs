@@ -6,6 +6,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The dimensions of the program's terminal, in cells.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TerminalSize {
+    pub columns: u16,
+    pub rows: u16,
+}
+
+impl TerminalSize {
+    /// Keeps sizes usable for programs that lay out output by width.
+    fn clamped(self) -> Self {
+        Self {
+            columns: self.columns.max(20),
+            rows: self.rows.max(1),
+        }
+    }
+}
+
+/// A handle for resizing the program's terminal.
+#[cfg(unix)]
+type Terminal = std::os::fd::OwnedFd;
+#[cfg(not(unix))]
+type Terminal = ();
+
 pub enum RunStatus {
     Running,
     Exited(ExitStatus, Duration),
@@ -26,14 +49,17 @@ pub struct Process {
     /// Complete output lines, possibly containing ANSI escape codes.
     pub lines: Vec<String>,
     interrupted: bool,
+    terminal: Option<Terminal>,
+    size: TerminalSize,
     pub started: Instant,
     pub status: RunStatus,
 }
 
 impl Process {
-    /// Spawns `command` with a terminal `columns` wide.
-    pub fn spawn(mut command: Command, columns: u16) -> io::Result<Self> {
-        let channel = Channel::open(columns)?;
+    /// Spawns `command` with a terminal of the given size.
+    pub fn spawn(mut command: Command, size: TerminalSize) -> io::Result<Self> {
+        let size = size.clamped();
+        let channel = Channel::open(size)?;
 
         // Its own process group, so stopping it also stops anything it started (like a
         // compiler still running under `sh`).
@@ -65,6 +91,8 @@ impl Process {
             pending: Vec::new(),
             lines: Vec::new(),
             interrupted: false,
+            terminal: channel.terminal,
+            size,
             started: Instant::now(),
             status: RunStatus::Running,
         })
@@ -98,13 +126,7 @@ impl Process {
 
     /// The output after the last newline, e.g. `Name: ` while waiting for input.
     pub fn partial(&self) -> String {
-        // Leave out a character still being received.
-        let complete = match std::str::from_utf8(&self.pending) {
-            Ok(_) => self.pending.len(),
-            Err(err) if err.error_len().is_none() => err.valid_up_to(),
-            Err(_) => self.pending.len(),
-        };
-
+        let complete = complete_utf8_len(&self.pending);
         clean(&String::from_utf8_lossy(&self.pending[..complete]))
     }
 
@@ -132,6 +154,25 @@ impl Process {
         self.input = None;
     }
 
+    /// Resizes the program's terminal and tells the program, like a terminal window
+    /// being resized.
+    pub fn resize(&mut self, size: TerminalSize) {
+        let size = size.clamped();
+        if size == self.size || !self.is_running() {
+            return;
+        }
+        self.size = size;
+
+        #[cfg(unix)]
+        if let Some(terminal) = &self.terminal {
+            set_size(terminal, size);
+            // The program isn't in the terminal's foreground group (it's not its
+            // controlling terminal), so the kernel won't send this itself.
+            // SAFETY: as in `signal_group`.
+            unsafe { libc::killpg(self.child.id() as libc::pid_t, libc::SIGWINCH) };
+        }
+    }
+
     /// Asks the program to stop, like ctrl+c in a terminal. A second call kills it.
     pub fn interrupt(&mut self) {
         if !self.is_running() {
@@ -153,6 +194,14 @@ impl Drop for Process {
             kill_group(&mut self.child);
             let _ = self.child.wait();
         }
+    }
+}
+
+/// Length of `bytes` without a trailing character that's still being received.
+fn complete_utf8_len(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Err(err) if err.error_len().is_none() => err.valid_up_to(),
+        _ => bytes.len(),
     }
 }
 
@@ -184,22 +233,18 @@ struct Channel {
     stdin: Stdio,
     stdout: Stdio,
     stderr: Stdio,
+    terminal: Option<Terminal>,
 }
 
 impl Channel {
     /// A pseudo-terminal for all three streams.
     #[cfg(unix)]
-    fn open(columns: u16) -> io::Result<Self> {
+    fn open(size: TerminalSize) -> io::Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
         let mut master = -1;
         let mut slave = -1;
-        let mut size = libc::winsize {
-            ws_row: 24,
-            ws_col: columns.max(20),
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
+        let mut size = winsize(size);
 
         // SAFETY: all pointers are valid for the call; the name and termios are optional.
         let result = unsafe {
@@ -234,6 +279,7 @@ impl Channel {
         }
 
         let writer = master.try_clone()?;
+        let terminal = master.try_clone()?;
         let stdout = slave.try_clone()?;
         let stderr = slave.try_clone()?;
 
@@ -243,12 +289,13 @@ impl Channel {
             stdin: slave.into(),
             stdout: stdout.into(),
             stderr: stderr.into(),
+            terminal: Some(terminal),
         })
     }
 
     /// Without ptys: stdout and stderr merged through one pipe, stdin a pipe.
     #[cfg(not(unix))]
-    fn open(_columns: u16) -> io::Result<Self> {
+    fn open(_size: TerminalSize) -> io::Result<Self> {
         let (reader, writer) = io::pipe()?;
         let stderr = writer.try_clone()?;
 
@@ -258,8 +305,28 @@ impl Channel {
             stdin: Stdio::piped(),
             stdout: writer.into(),
             stderr: stderr.into(),
+            terminal: None,
         })
     }
+}
+
+#[cfg(unix)]
+fn winsize(size: TerminalSize) -> libc::winsize {
+    libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
+}
+
+#[cfg(unix)]
+fn set_size(terminal: &Terminal, size: TerminalSize) {
+    use std::os::fd::AsRawFd;
+
+    let size = winsize(size);
+    // SAFETY: `terminal` is an open pty and `size` is a valid winsize.
+    unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ, &size) };
 }
 
 fn forward(mut reader: Box<dyn Read + Send>, tx: Sender<Vec<u8>>) {
@@ -302,4 +369,214 @@ fn kill_group(child: &mut Child) {
 #[cfg(not(unix))]
 fn kill_group(child: &mut Child) {
     let _ = child.kill();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_keeps_the_last_carriage_return_segment() {
+        assert_eq!(clean("progress 10%\rprogress 100%\r\n"), "progress 100%");
+    }
+
+    #[test]
+    fn clean_applies_backspaces_and_expands_tabs() {
+        assert_eq!(clean("abc\x08\x08d\n"), "ad");
+        assert_eq!(clean("a\tb"), "a    b");
+        assert_eq!(clean("\x08\x08x"), "x");
+    }
+
+    #[test]
+    fn complete_utf8_len_holds_back_a_split_character() {
+        let bytes = "é".as_bytes();
+        assert_eq!(complete_utf8_len(b"abc"), 3);
+        assert_eq!(complete_utf8_len(&[b'a', bytes[0]]), 1);
+        // Invalid bytes aren't held back forever.
+        assert_eq!(complete_utf8_len(&[b'a', 0xff, b'b']), 3);
+    }
+}
+
+/// These run real programs on a pseudo-terminal.
+#[cfg(all(test, unix))]
+mod process_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    const SIZE: TerminalSize = TerminalSize {
+        columns: 80,
+        rows: 24,
+    };
+
+    fn sh(script: &str) -> Process {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        Process::spawn(command, SIZE).unwrap()
+    }
+
+    /// Polls until `done` holds, failing after a few seconds.
+    fn wait_for(process: &mut Process, done: impl Fn(&Process) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            process.poll();
+            if done(process) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out; output: {:?}",
+                process.lines
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn exit_code(process: &Process) -> Option<i32> {
+        match &process.status {
+            RunStatus::Exited(status, _) => status.code(),
+            RunStatus::Running => None,
+        }
+    }
+
+    /// Waits for exit and for the output that's still in flight.
+    fn wait_for_exit(process: &mut Process, lines: usize) {
+        wait_for(process, |p| !p.is_running() && p.lines.len() >= lines);
+    }
+
+    #[test]
+    fn keeps_stdout_and_stderr_in_order() {
+        let mut process = sh("for i in 1 2 3; do echo out$i; echo err$i >&2; done");
+        wait_for_exit(&mut process, 6);
+        assert_eq!(
+            process.lines,
+            ["out1", "err1", "out2", "err2", "out3", "err3"]
+        );
+    }
+
+    #[test]
+    fn line_buffers_like_a_terminal() {
+        // Pipes would make Python buffer stdout until exit, putting stderr first.
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            "import sys\nfor i in range(3):\n print('out', i)\n print('err', i, file=sys.stderr)",
+        ]);
+        let Ok(mut process) = Process::spawn(command, SIZE) else {
+            return; // python3 isn't installed
+        };
+
+        wait_for_exit(&mut process, 6);
+        assert_eq!(
+            process.lines,
+            ["out 0", "err 0", "out 1", "err 1", "out 2", "err 2"]
+        );
+    }
+
+    #[test]
+    fn shows_prompts_and_echoes_input() {
+        let mut process = sh("printf 'Name: '; read name; echo \"Hi $name\"");
+        wait_for(&mut process, |p| p.partial() == "Name: ");
+
+        process.send_line("Bob");
+        wait_for_exit(&mut process, 2);
+        assert_eq!(process.lines, ["Name: Bob", "Hi Bob"]);
+        assert_eq!(process.partial(), "");
+    }
+
+    #[test]
+    fn end_of_input_closes_stdin() {
+        let mut process = sh("cat");
+        process.send_line("a");
+        process.send_eof();
+        // Our echo of the input, then cat's copy of it.
+        wait_for_exit(&mut process, 2);
+        assert_eq!(process.lines, ["a", "a"]);
+        assert_eq!(exit_code(&process), Some(0));
+    }
+
+    #[test]
+    fn interrupt_sends_sigint() {
+        let mut process =
+            sh("trap 'echo caught; exit 3' INT; echo ready; while :; do sleep 0.05; done");
+        wait_for(&mut process, |p| p.lines.iter().any(|line| line == "ready"));
+
+        process.interrupt();
+        wait_for_exit(&mut process, 2);
+        assert_eq!(process.lines, ["ready", "caught"]);
+        assert_eq!(exit_code(&process), Some(3));
+    }
+
+    #[test]
+    fn a_second_interrupt_kills() {
+        let mut process = sh("trap '' INT; echo ready; while :; do sleep 0.05; done");
+        wait_for(&mut process, |p| p.lines.iter().any(|line| line == "ready"));
+
+        process.interrupt();
+        thread::sleep(Duration::from_millis(100));
+        process.poll();
+        assert!(process.is_running(), "SIGINT should be ignored");
+
+        process.interrupt();
+        wait_for(&mut process, |p| !p.is_running());
+        assert_eq!(exit_code(&process), None);
+    }
+
+    #[test]
+    fn dropping_kills_the_whole_process_group() {
+        let mut process = sh("sleep 30 & echo $!; wait");
+        wait_for(&mut process, |p| !p.lines.is_empty());
+        let sleep: libc::pid_t = process.lines[0].parse().unwrap();
+
+        drop(process);
+
+        // The orphaned `sleep` is killed too (and reaped by init shortly after).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: kill with signal 0 only checks whether the process exists.
+        while unsafe { libc::kill(sleep, 0) } == 0 {
+            assert!(Instant::now() < deadline, "sleep {sleep} survived");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn programs_see_a_terminal_of_the_given_width() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "stty size"]);
+        let mut process = Process::spawn(
+            command,
+            TerminalSize {
+                columns: 123,
+                rows: 45,
+            },
+        )
+        .unwrap();
+        wait_for_exit(&mut process, 1);
+        assert_eq!(process.lines, ["45 123"]);
+    }
+
+    #[test]
+    fn resizing_updates_the_terminal_and_signals_the_program() {
+        let mut process = sh("trap 'stty size' WINCH; echo ready; while :; do sleep 0.05; done");
+        wait_for(&mut process, |p| p.lines.iter().any(|line| line == "ready"));
+
+        process.resize(TerminalSize {
+            columns: 100,
+            rows: 30,
+        });
+        wait_for(&mut process, |p| {
+            p.lines.iter().any(|line| line == "30 100")
+        });
+    }
+
+    #[test]
+    fn resizing_to_the_same_size_does_nothing() {
+        let mut process = sh("trap 'echo winch' WINCH; echo ready; while :; do sleep 0.05; done");
+        wait_for(&mut process, |p| p.lines.iter().any(|line| line == "ready"));
+
+        process.resize(SIZE);
+        thread::sleep(Duration::from_millis(200));
+        process.poll();
+        assert_eq!(process.lines, ["ready"]);
+    }
 }

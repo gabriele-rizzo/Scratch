@@ -16,6 +16,9 @@ pub use scroll::*;
 mod confirm;
 pub use confirm::*;
 
+mod wrap;
+pub use wrap::*;
+
 use std::time::{Duration, Instant};
 
 use ratatui::{

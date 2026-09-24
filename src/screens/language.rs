@@ -90,18 +90,7 @@ impl Language {
     /// How well `runner` matches the input: exact, then prefix, then substring.
     /// `None` hides it.
     fn rank(&self, runner: &Runner) -> Option<u8> {
-        let query = self.input.value().trim().to_lowercase();
-        let name = runner.name.to_lowercase();
-
-        if name == query {
-            Some(0)
-        } else if name.starts_with(&query) {
-            Some(1)
-        } else if name.contains(&query) {
-            Some(2)
-        } else {
-            None
-        }
+        rank(runner.name, self.input.value())
     }
 
     /// Indices of runners that match the input, best matches first.
@@ -273,6 +262,23 @@ impl Language {
     }
 }
 
+/// How well `name` matches `query`, case-insensitively: 0 exact, 1 prefix,
+/// 2 substring. `None` when it doesn't match.
+fn rank(name: &str, query: &str) -> Option<u8> {
+    let query = query.trim().to_lowercase();
+    let name = name.to_lowercase();
+
+    if name == query {
+        Some(0)
+    } else if name.starts_with(&query) {
+        Some(1)
+    } else if name.contains(&query) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
 impl Screen for Language {
     fn update(&mut self) -> Result<ScreenAction> {
         self.poll_detection();
@@ -312,8 +318,19 @@ impl Screen for Language {
             return Ok(ScreenAction::None);
         }
 
-        let Event::Key(key) = event else {
-            return Ok(ScreenAction::None);
+        let key = match event {
+            Event::Key(key) => key,
+            Event::Paste(text) => {
+                match &mut self.command_bar {
+                    Some(command_bar) => command_bar.paste(&text),
+                    None => {
+                        self.input.insert(utils::first_line(&text));
+                        self.selected = 0;
+                    }
+                }
+                return Ok(ScreenAction::None);
+            }
+            _ => return Ok(ScreenAction::None),
         };
 
         if key.kind != KeyEventKind::Press {
@@ -358,5 +375,28 @@ impl Screen for Language {
         }
 
         Ok(ScreenAction::None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranks_exact_then_prefix_then_substring() {
+        assert_eq!(rank("C", "c"), Some(0));
+        assert_eq!(rank("C++", "c"), Some(1));
+        assert_eq!(rank("JavaScript", "c"), Some(2));
+        assert_eq!(rank("Rust", "c"), None);
+    }
+
+    #[test]
+    fn ranking_ignores_case_and_surrounding_space() {
+        assert_eq!(rank("Python", "  PYTH "), Some(1));
+    }
+
+    #[test]
+    fn empty_query_matches_everything() {
+        assert!(RUNNERS.iter().all(|runner| rank(runner.name, "").is_some()));
     }
 }

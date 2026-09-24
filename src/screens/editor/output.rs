@@ -10,12 +10,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Block, BorderType, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Wrap,
     },
 };
 
 use crate::{
-    runners::{Process, RunStatus},
+    runners::{Process, RunStatus, TerminalSize},
     ui::{self, ACCENT, ERROR, Input, MUTED, SUBTLE, SUCCESS, SURFACE, Scroll, TEXT},
 };
 
@@ -30,6 +29,15 @@ enum Run {
     Failed { title: String, detail: String },
 }
 
+/// How many rows each output line wraps to at `width`, kept up to date as lines
+/// arrive so long output isn't rewrapped every frame.
+#[derive(Default)]
+struct RowCache {
+    width: usize,
+    counts: Vec<usize>,
+    total: usize,
+}
+
 /// The output panel for the latest run.
 pub struct Output {
     run: Run,
@@ -38,17 +46,22 @@ pub struct Output {
     input: Input,
     /// Whether keys go to the program instead of the editor.
     focused: bool,
+    /// The program's arguments, shown in the title.
+    args: String,
+    rows: RowCache,
     /// Where the panel was last drawn, for mouse hit-testing.
     pub area: Rect,
 }
 
 impl Output {
-    pub fn started(process: Process, workdir: &Path) -> Self {
-        Self::new(Run::Started {
+    pub fn started(process: Process, workdir: &Path, args: &[String]) -> Self {
+        let mut output = Self::new(Run::Started {
             process,
             workdir: format!("{}/", workdir.display()),
             rendered: Vec::new(),
-        })
+        });
+        output.args = crate::utils::join_args(args);
+        output
     }
 
     pub fn failed(title: impl Into<String>, detail: impl ToString) -> Self {
@@ -64,6 +77,8 @@ impl Output {
             scroll: Scroll::default(),
             input: Input::default(),
             focused: false,
+            args: String::new(),
+            rows: RowCache::default(),
             area: Rect::default(),
         }
     }
@@ -102,6 +117,20 @@ impl Output {
     /// Edits the pending input line.
     pub fn input(&mut self, key: KeyEvent) {
         self.input.handle(key);
+    }
+
+    /// Pastes into the input; every complete line is sent, the rest stays to edit.
+    pub fn paste(&mut self, text: &str) {
+        let text = crate::utils::normalize_newlines(text);
+        let mut lines = text.split('\n').peekable();
+
+        while let Some(line) = lines.next() {
+            self.input.insert(line);
+
+            if lines.peek().is_some() {
+                self.submit();
+            }
+        }
     }
 
     /// Sends the typed line to the program.
@@ -158,6 +187,21 @@ impl Output {
 
         let partial = process.partial();
         (!partial.is_empty()).then(|| render_line(&partial, workdir))
+    }
+
+    fn title(&self) -> Line<'static> {
+        let mut title = vec![Span::styled(
+            " Output ",
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+        )];
+
+        if !self.args.is_empty() {
+            title.push(Span::styled("· ", Style::new().fg(MUTED)));
+            title.push(Span::styled(self.args.clone(), Style::new().fg(SUBTLE)));
+            title.push(Span::raw(" "));
+        }
+
+        Line::from(title)
     }
 
     fn status(&self) -> Line<'static> {
@@ -253,6 +297,38 @@ impl Output {
         }
     }
 
+    /// Counts rows for lines that arrived since the last frame, or for all of them
+    /// when the width changed.
+    fn update_row_counts(&mut self, width: usize) {
+        let rows = &mut self.rows;
+        if rows.width != width {
+            *rows = RowCache {
+                width,
+                ..RowCache::default()
+            };
+        }
+
+        let rendered = match &self.run {
+            Run::Started { rendered, .. } => rendered.as_slice(),
+            Run::Failed { .. } => &[],
+        };
+
+        for line in &rendered[rows.counts.len()..] {
+            let count = ui::row_count(line, width);
+            rows.counts.push(count);
+            rows.total += count;
+        }
+    }
+
+    /// The terminal size a running program gets in a panel drawn in `area`: inside
+    /// the borders and padding, above the input row. Matches `draw`.
+    pub fn terminal_size(area: Rect) -> TerminalSize {
+        TerminalSize {
+            columns: area.width.saturating_sub(4),
+            rows: area.height.saturating_sub(3),
+        }
+    }
+
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.area = area;
 
@@ -261,10 +337,7 @@ impl Output {
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(border))
             .padding(Padding::horizontal(1))
-            .title(Span::styled(
-                " Output ",
-                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-            ))
+            .title(self.title())
             .title_top(self.status().right_aligned());
 
         let inner = block.inner(area);
@@ -278,9 +351,30 @@ impl Output {
             (inner, None)
         };
 
+        // The program's terminal matches the space its output gets.
+        if let Some(process) = self.process_mut() {
+            process.resize(TerminalSize {
+                columns: content.width,
+                rows: content.height,
+            });
+        }
+
+        let width = content.width as usize;
+        self.update_row_counts(width);
+
         let partial = self.partial();
-        let trailer = self.trailer(partial.is_some());
-        let total = self.rendered().len() + usize::from(partial.is_some()) + trailer.len();
+        let extra: Vec<Line<'static>> = partial
+            .iter()
+            .cloned()
+            .chain(self.trailer(partial.is_some()))
+            .collect();
+        let extra_counts: Vec<usize> = extra
+            .iter()
+            .map(|line| ui::row_count(line, width))
+            .collect();
+
+        // Everything below counts wrapped rows, not lines.
+        let total = self.rows.total + extra_counts.iter().sum::<usize>();
         let viewport = content.height as usize;
         let offset = self.scroll.update(total, viewport);
 
@@ -298,23 +392,31 @@ impl Output {
         };
         frame.render_widget(block, area);
 
-        // Only the visible lines are cloned, however long the output gets.
-        let lines: Vec<Line> = self
+        // Only the visible lines are wrapped and cloned, however long the output gets.
+        let lines = self
             .rendered()
             .iter()
-            .cloned()
-            .chain(partial)
-            .chain(trailer)
-            .skip(offset)
-            .take(viewport)
-            .collect();
-        let mut paragraph = Paragraph::new(lines);
+            .zip(self.rows.counts.iter().copied())
+            .chain(extra.iter().zip(extra_counts));
 
-        // Errors are only a few lines, so wrapping them can't throw off the scroll math.
-        if let Run::Failed { .. } = self.run {
-            paragraph = paragraph.wrap(Wrap { trim: false });
+        let mut skip = offset;
+        let mut visible: Vec<Line> = Vec::with_capacity(viewport);
+
+        for (line, count) in lines {
+            if visible.len() == viewport {
+                break;
+            }
+            if skip >= count {
+                skip -= count;
+                continue;
+            }
+
+            let remaining = viewport - visible.len();
+            visible.extend(ui::wrap(line, width).into_iter().skip(skip).take(remaining));
+            skip = 0;
         }
-        frame.render_widget(paragraph, content);
+
+        frame.render_widget(Paragraph::new(visible), content);
 
         if let Some(row) = input_row {
             self.draw_input(frame, row);
@@ -419,4 +521,121 @@ fn render_line(raw: &str, workdir: &str) -> Line<'static> {
     };
 
     Line::styled(raw.into_owned(), style)
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::*;
+
+    const WORKDIR: &str = "/tmp/scratch-1-2/";
+
+    fn text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn hides_the_temporary_directory() {
+        let line = render_line("  File \"/tmp/scratch-1-2/main.py\", line 1", WORKDIR);
+        assert_eq!(text(&line), "  File \"main.py\", line 1");
+    }
+
+    #[test]
+    fn keeps_the_programs_colors() {
+        let line = render_line("\x1b[31mred\x1b[0m plain", WORKDIR);
+        assert_eq!(text(&line), "red plain");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn emphasizes_plain_errors_and_warnings() {
+        let error = render_line("error[E0308]: mismatched types", WORKDIR);
+        let exception = render_line("ValueError: bad value", WORKDIR);
+        let warning = render_line("warning: unused variable", WORKDIR);
+        let plain = render_line("hello", WORKDIR);
+
+        assert_eq!(error.style.fg, Some(ERROR));
+        assert_eq!(exception.style.fg, Some(ERROR));
+        assert_eq!(warning.style.fg, Some(ACCENT));
+        assert_eq!(plain.style.fg, Some(TEXT));
+    }
+
+    #[cfg(unix)]
+    mod draw {
+        use std::{
+            process::Command,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        use ratatui::{Terminal, backend::TestBackend};
+
+        use super::*;
+
+        const AREA: Rect = Rect::new(0, 0, 40, 12);
+
+        fn run(script: &str) -> Output {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(script);
+            let process = Process::spawn(command, Output::terminal_size(AREA)).unwrap();
+            Output::started(process, Path::new("/nonexistent"), &[])
+        }
+
+        fn draw(output: &mut Output) -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(AREA.width, AREA.height)).unwrap();
+            terminal.draw(|frame| output.draw(frame, AREA)).unwrap();
+
+            let buffer = terminal.backend().buffer();
+            (0..AREA.height)
+                .map(|y| {
+                    (0..AREA.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect()
+        }
+
+        fn wait_for(output: &mut Output, done: impl Fn(&Output) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(output) {
+                assert!(Instant::now() < deadline, "timed out");
+                thread::sleep(Duration::from_millis(10));
+                output.poll();
+            }
+        }
+
+        #[test]
+        fn wraps_long_lines_inside_the_panel() {
+            let mut output = run(&format!("echo {}", "a".repeat(80)));
+            wait_for(&mut output, |output| {
+                !output.is_running() && !output.rendered().is_empty()
+            });
+
+            let screen = draw(&mut output);
+            // 36 columns inside the borders and padding: 80 chars wrap to 3 rows.
+            assert_eq!(screen[1].trim_matches(['│', ' ']), "a".repeat(36));
+            assert_eq!(screen[2].trim_matches(['│', ' ']), "a".repeat(36));
+            assert_eq!(screen[3].trim_matches(['│', ' ']), "a".repeat(8));
+            assert_eq!(output.rows.total, 3);
+        }
+
+        #[test]
+        fn starting_size_matches_the_drawn_panel() {
+            // If they differed, the first frame would resize and signal the program.
+            let mut output =
+                run("trap 'echo winch' WINCH; echo ready; while :; do sleep 0.05; done");
+            wait_for(&mut output, |output| !output.rendered().is_empty());
+
+            draw(&mut output);
+            thread::sleep(Duration::from_millis(200));
+            output.poll();
+
+            let lines: Vec<String> = output.rendered().iter().map(text).collect();
+            assert_eq!(lines, ["ready"]);
+        }
+    }
 }

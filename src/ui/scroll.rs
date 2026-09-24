@@ -52,3 +52,66 @@ impl Scroll {
         self.down((self.viewport / 2).max(1));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn follows_new_lines_by_default() {
+        let mut scroll = Scroll::default();
+        assert_eq!(scroll.update(5, 10), 0);
+        assert_eq!(scroll.update(30, 10), 20);
+        assert_eq!(scroll.update(40, 10), 30);
+    }
+
+    #[test]
+    fn scrolling_up_stops_following() {
+        let mut scroll = Scroll::default();
+        scroll.update(30, 10);
+        scroll.up(5);
+        assert_eq!(scroll.update(30, 10), 15);
+        // New output doesn't move the view.
+        assert_eq!(scroll.update(50, 10), 15);
+    }
+
+    #[test]
+    fn reaching_the_bottom_follows_again() {
+        let mut scroll = Scroll::default();
+        scroll.update(30, 10);
+        scroll.up(5);
+        scroll.update(30, 10);
+        scroll.down(100);
+        assert_eq!(scroll.update(30, 10), 20);
+        assert_eq!(scroll.update(40, 10), 30);
+    }
+
+    #[test]
+    fn pages_by_half_the_viewport() {
+        let mut scroll = Scroll::default();
+        scroll.update(100, 10);
+        scroll.page_up();
+        assert_eq!(scroll.update(100, 10), 85);
+        scroll.page_down();
+        assert_eq!(scroll.update(100, 10), 90);
+    }
+
+    #[test]
+    fn follow_jumps_back_to_the_bottom() {
+        let mut scroll = Scroll::default();
+        scroll.update(100, 10);
+        scroll.up(50);
+        scroll.update(100, 10);
+        scroll.follow();
+        assert_eq!(scroll.update(120, 10), 110);
+    }
+
+    #[test]
+    fn clamps_when_output_shrinks() {
+        let mut scroll = Scroll::default();
+        scroll.update(100, 10);
+        scroll.up(10);
+        scroll.update(100, 10);
+        assert_eq!(scroll.update(20, 10), 10);
+    }
+}

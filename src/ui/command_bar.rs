@@ -84,6 +84,11 @@ impl CommandBar {
         }
     }
 
+    pub fn paste(&mut self, text: &str) {
+        self.input.insert(crate::utils::first_line(text));
+        self.selected = 0;
+    }
+
     pub fn handle(&mut self, key: KeyEvent) -> CommandEvent {
         let suggestions = self.suggestions();
 
@@ -203,5 +208,154 @@ impl CommandBar {
         let mut state = ListState::default().with_selected(Some(self.selected));
         frame.render_widget(Clear, popup);
         frame.render_stateful_widget(list, popup, &mut state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyModifiers;
+
+    use super::*;
+
+    const SPECS: &[CommandSpec] = &[
+        CommandSpec {
+            name: "run",
+            args: "",
+            description: "",
+            keys: "",
+        },
+        CommandSpec {
+            name: "save",
+            args: "[path]",
+            description: "",
+            keys: "",
+        },
+        CommandSpec {
+            name: "back",
+            args: "",
+            description: "",
+            keys: "",
+        },
+    ];
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn type_text(bar: &mut CommandBar, text: &str) {
+        for c in text.chars() {
+            bar.handle(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn submit(text: &str) -> CommandEvent {
+        let mut bar = CommandBar::new(SPECS);
+        type_text(&mut bar, text);
+        bar.handle(key(KeyCode::Enter))
+    }
+
+    fn assert_submits(event: CommandEvent, expected: &str, expected_args: &str) {
+        match event {
+            CommandEvent::Submit { name, args } => {
+                assert_eq!((name, args.as_str()), (expected, expected_args))
+            }
+            _ => panic!("expected {expected} to be submitted"),
+        }
+    }
+
+    #[test]
+    fn runs_an_exact_name() {
+        assert_submits(submit("back"), "back", "");
+    }
+
+    #[test]
+    fn ignores_a_leading_colon() {
+        assert_submits(submit(":back"), "back", "");
+        assert_submits(submit(": save out.rs"), "save", "out.rs");
+    }
+
+    #[test]
+    fn passes_arguments() {
+        assert_submits(submit("save  some/file.rs  "), "save", "some/file.rs");
+    }
+
+    #[test]
+    fn runs_the_best_suggestion_for_a_prefix() {
+        assert_submits(submit("s"), "save", "");
+        assert_submits(submit("B"), "back", "");
+    }
+
+    #[test]
+    fn enter_with_nothing_typed_runs_the_highlighted_command() {
+        let mut bar = CommandBar::new(SPECS);
+        bar.handle(key(KeyCode::Down));
+        bar.handle(key(KeyCode::Down));
+        assert_submits(bar.handle(key(KeyCode::Enter)), "back", "");
+    }
+
+    #[test]
+    fn selection_stays_within_the_suggestions() {
+        let mut bar = CommandBar::new(SPECS);
+        for _ in 0..10 {
+            bar.handle(key(KeyCode::Down));
+        }
+        assert_submits(bar.handle(key(KeyCode::Enter)), "back", "");
+        for _ in 0..10 {
+            bar.handle(key(KeyCode::Up));
+        }
+        assert_submits(bar.handle(key(KeyCode::Enter)), "run", "");
+    }
+
+    #[test]
+    fn reports_unknown_commands() {
+        match submit("nope") {
+            CommandEvent::Unknown(name) => assert_eq!(name, "nope"),
+            _ => panic!("expected an unknown command"),
+        }
+    }
+
+    #[test]
+    fn arguments_only_match_the_exact_command() {
+        // `sa x` isn't `save x`: once arguments start, the name must be complete.
+        assert!(matches!(submit("sa x"), CommandEvent::Unknown(_)));
+    }
+
+    #[test]
+    fn tab_completes_and_leaves_room_for_arguments() {
+        let mut bar = CommandBar::new(SPECS);
+        type_text(&mut bar, "sa");
+        bar.handle(key(KeyCode::Tab));
+        assert_eq!(bar.input.value(), "save ");
+
+        let mut bar = CommandBar::new(SPECS);
+        type_text(&mut bar, "r");
+        bar.handle(key(KeyCode::Tab));
+        assert_eq!(bar.input.value(), "run");
+    }
+
+    #[test]
+    fn esc_or_backspace_on_empty_cancels() {
+        let mut bar = CommandBar::new(SPECS);
+        assert!(matches!(
+            bar.handle(key(KeyCode::Esc)),
+            CommandEvent::Cancel
+        ));
+        assert!(matches!(
+            bar.handle(key(KeyCode::Backspace)),
+            CommandEvent::Cancel
+        ));
+
+        type_text(&mut bar, "r");
+        assert!(matches!(
+            bar.handle(key(KeyCode::Backspace)),
+            CommandEvent::None
+        ));
+    }
+
+    #[test]
+    fn paste_uses_the_first_line() {
+        let mut bar = CommandBar::new(SPECS);
+        bar.paste("save a.rs\nrm -rf /");
+        assert_eq!(bar.input.value(), "save a.rs");
     }
 }

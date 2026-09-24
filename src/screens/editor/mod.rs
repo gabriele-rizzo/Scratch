@@ -1,6 +1,6 @@
 use std::{
-    env, fs,
-    path::PathBuf,
+    env, fs, io,
+    path::{Path, PathBuf},
     process,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,7 +14,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
-use ratatui_code_editor::{editor::Editor as CodeEditor, theme::vesper};
+use ratatui_code_editor::{actions::InsertText, editor::Editor as CodeEditor, theme::vesper};
 use tuimon::{Screen, ScreenAction};
 
 use crate::{
@@ -34,8 +34,8 @@ const MOUSE_SCROLL_LINES: usize = 3;
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "run",
-        args: "",
-        description: "Run the file",
+        args: "[args]",
+        description: "Run the file with arguments",
         keys: "ctrl+r",
     },
     CommandSpec {
@@ -83,15 +83,22 @@ impl Leave {
 pub struct Editor {
     editor: CodeEditor,
     editor_area: Rect,
-    /// Terminal width, used to size the program's terminal.
-    width: u16,
+    /// The whole screen as last drawn, used to size the program's terminal.
+    screen: Rect,
     runner: &'static Runner,
     binary: PathBuf,
     /// Temporary directory the file is written to before running.
     workdir: PathBuf,
     /// Where the file was last saved.
     path: Option<PathBuf>,
+    /// Arguments for the program; ctrl+r reuses the last ones.
+    args: Vec<String>,
+    /// The text as last saved (or the starter code), to tell whether there are
+    /// unsaved changes.
     saved: String,
+    saved_chars: usize,
+    /// Recomputed only when the text may have changed, not on every frame.
+    dirty: bool,
     output: Option<Output>,
     command_bar: Option<CommandBar>,
     toast: Option<Toast>,
@@ -101,7 +108,8 @@ pub struct Editor {
 
 impl Editor {
     pub fn new(runner: &'static Runner, binary: PathBuf) -> Result<Self> {
-        let editor = CodeEditor::new(runner.syntax, "", vesper())?;
+        let mut editor = CodeEditor::new(runner.syntax, runner.template, vesper())?;
+        editor.set_cursor(starter_cursor(runner.template));
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.subsec_nanos());
@@ -110,12 +118,15 @@ impl Editor {
         Ok(Self {
             editor,
             editor_area: Rect::default(),
-            width: 80,
+            screen: Rect::new(0, 0, 80, 24),
             runner,
             binary,
             workdir,
             path: None,
-            saved: String::new(),
+            args: Vec::new(),
+            saved: runner.template.to_string(),
+            saved_chars: runner.template.chars().count(),
+            dirty: false,
             output: None,
             command_bar: None,
             toast: None,
@@ -125,7 +136,13 @@ impl Editor {
 
     fn execute(&mut self, name: &str, args: &str) -> ScreenAction {
         match name {
-            "run" => self.run(),
+            "run" => match utils::split_args(args) {
+                Ok(args) => {
+                    self.args = args;
+                    self.run();
+                }
+                Err(err) => self.toast = Some(Toast::error(format!("Couldn't run: {err}"))),
+            },
             "save" => {
                 self.save(args);
             }
@@ -139,7 +156,14 @@ impl Editor {
     }
 
     fn is_dirty(&self) -> bool {
-        self.editor.get_content() != self.saved
+        self.dirty
+    }
+
+    /// Call after anything that may have edited the text.
+    fn refresh_dirty(&mut self) {
+        // Comparing lengths is O(1); the full comparison only runs when they match.
+        self.dirty = self.editor.code_ref().len() != self.saved_chars
+            || self.editor.get_content() != self.saved;
     }
 
     /// Where `save` without a path writes to.
@@ -155,7 +179,7 @@ impl Editor {
             return leave.action();
         }
 
-        let file = self.save_path().display().to_string();
+        let file = utils::display_home(&self.save_path());
         self.command_bar = None;
         self.leaving = Some((leave, UnsavedPrompt { file }));
         ScreenAction::None
@@ -178,13 +202,14 @@ impl Editor {
         }
 
         let mut command = (self.runner.command)(&self.binary, &file);
-        command.current_dir(&self.workdir);
+        command.args(&self.args).current_dir(&self.workdir);
 
-        // Borders and padding take 4 columns.
-        let columns = self.width.saturating_sub(4);
+        // Start at the size the output panel is about to have.
+        let (_, panel, _) = layout(self.screen, 1, true);
+        let size = Output::terminal_size(panel.unwrap_or(self.screen));
 
-        self.output = Some(match Process::spawn(command, columns) {
-            Ok(process) => Output::started(process, &self.workdir),
+        self.output = Some(match Process::spawn(command, size) {
+            Ok(process) => Output::started(process, &self.workdir, &self.args),
             Err(err) => {
                 let name = self
                     .binary
@@ -199,27 +224,63 @@ impl Editor {
         });
     }
 
+    /// Where `save <args>` writes: the given path (`~` expanded, and a folder
+    /// meaning `scratch.<ext>` inside it), or the default.
+    fn target_path(&self, args: &str) -> Result<PathBuf, String> {
+        let [path] = utils::split_args(args)?
+            .try_into()
+            .map_err(|args: Vec<String>| {
+                if args.is_empty() {
+                    String::new()
+                } else {
+                    "give one path; quote it if it has spaces".to_string()
+                }
+            })?;
+
+        let name = format!("scratch.{}", self.runner.extension);
+        let expanded = utils::expand_home(&path);
+
+        if path.ends_with('/') || expanded.is_dir() {
+            Ok(expanded.join(name))
+        } else {
+            Ok(expanded)
+        }
+    }
+
     /// Returns whether the file was saved.
     fn save(&mut self, args: &str) -> bool {
-        let path = if args.is_empty() {
+        let path = if args.trim().is_empty() {
             self.save_path()
         } else {
-            PathBuf::from(args)
+            match self.target_path(args) {
+                Ok(path) => path,
+                Err(err) => {
+                    self.toast = Some(Toast::error(format!("Couldn't save: {err}")));
+                    return false;
+                }
+            }
         };
 
         let content = self.editor.get_content();
+        let shown = utils::display_home(&path);
 
-        match fs::write(&path, &content) {
-            Ok(()) => {
-                self.toast = Some(Toast::success(format!("Saved {}", path.display())));
+        match write_creating_dirs(&path, &content) {
+            Ok(created) => {
+                let message = match created {
+                    Some(dir) => format!("Saved {shown} (created {})", utils::display_home(&dir)),
+                    None => format!("Saved {shown}"),
+                };
+                self.toast = Some(Toast::success(message));
                 self.path = Some(path);
+                self.saved_chars = content.chars().count();
                 self.saved = content;
+                self.dirty = false;
                 true
             }
             Err(err) => {
                 self.toast = Some(Toast::error(format!(
-                    "Couldn't save {}: {err}",
-                    path.display()
+                    "Couldn't save {shown}: {}",
+                    describe_io_error(&err)
                 )));
                 false
             }
@@ -237,7 +298,7 @@ impl Editor {
 
         match &self.path {
             Some(path) => left.push(Span::styled(
-                path.display().to_string(),
+                utils::display_home(path),
                 Style::new().fg(SUBTLE),
             )),
             None => left.push(Span::styled("untitled", Style::new().fg(MUTED).italic())),
@@ -294,21 +355,11 @@ impl Screen for Editor {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        self.width = frame.area().width;
+        self.screen = frame.area();
 
         let bottom = if self.command_bar.is_some() { 3 } else { 1 };
-        let [main_area, bottom_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(bottom)]).areas(frame.area());
-
-        let (editor_area, output_area) = match self.output {
-            Some(_) => {
-                let [editor, output] =
-                    Layout::vertical([Constraint::Percentage(60), Constraint::Min(5)])
-                        .areas(main_area);
-                (editor, Some(output))
-            }
-            None => (main_area, None),
-        };
+        let (editor_area, output_area, bottom_area) =
+            layout(frame.area(), bottom, self.output.is_some());
 
         self.editor_area = editor_area;
         frame.render_widget(&self.editor, self.editor_area);
@@ -371,6 +422,14 @@ impl Screen for Editor {
             });
         }
 
+        if let Some(output) = &mut self.output
+            && output.is_focused()
+            && let Event::Paste(text) = &event
+        {
+            output.paste(text);
+            return Ok(ScreenAction::None);
+        }
+
         // While the output panel has focus, keys go to the program.
         if let Some(output) = &mut self.output
             && output.is_focused()
@@ -408,8 +467,13 @@ impl Screen for Editor {
         }
 
         if let Some(command_bar) = &mut self.command_bar {
-            let Event::Key(key) = event else {
-                return Ok(ScreenAction::None);
+            let key = match event {
+                Event::Key(key) => key,
+                Event::Paste(text) => {
+                    command_bar.paste(&text);
+                    return Ok(ScreenAction::None);
+                }
+                _ => return Ok(ScreenAction::None),
             };
 
             return Ok(match command_bar.handle(key) {
@@ -479,7 +543,10 @@ impl Screen for Editor {
             {
                 self.save("");
             }
-            Event::Key(key) => self.editor.input(key, &self.editor_area)?,
+            Event::Key(key) => {
+                self.editor.input(key, &self.editor_area)?;
+                self.refresh_dirty();
+            }
             Event::Mouse(mouse) => {
                 if let MouseEventKind::Down(_) = mouse.kind
                     && let Some(output) = &mut self.output
@@ -489,7 +556,12 @@ impl Screen for Editor {
 
                 self.editor.mouse(mouse, &self.editor_area)?
             }
-            // Event::Paste(value)
+            Event::Paste(text) => {
+                // Inserted as-is (no auto-indent), as one undo step.
+                let text = utils::normalize_newlines(&text);
+                self.editor.apply(InsertText { text });
+                self.refresh_dirty();
+            }
             _ => {}
         };
 
@@ -501,5 +573,182 @@ impl Drop for Editor {
     fn drop(&mut self) {
         self.output = None;
         let _ = fs::remove_dir_all(&self.workdir);
+    }
+}
+
+/// Writes `content` to `path`, creating missing parent folders. Returns the
+/// topmost folder it had to create, if any.
+fn write_creating_dirs(path: &Path, content: &str) -> io::Result<Option<PathBuf>> {
+    let mut created = None;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        // The topmost missing ancestor is what gets created.
+        created = parent
+            .ancestors()
+            .take_while(|dir| !dir.as_os_str().is_empty() && !dir.exists())
+            .last()
+            .map(Path::to_path_buf);
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(path, content)?;
+    Ok(created)
+}
+
+/// Explains an I/O error in plain words, without the OS error number.
+fn describe_io_error(err: &io::Error) -> String {
+    match err.kind() {
+        io::ErrorKind::PermissionDenied => "permission denied".to_string(),
+        io::ErrorKind::IsADirectory => "that's a folder".to_string(),
+        io::ErrorKind::NotADirectory => "part of the path is a file, not a folder".to_string(),
+        io::ErrorKind::ReadOnlyFilesystem => "the disk is read-only".to_string(),
+        io::ErrorKind::StorageFull => "the disk is full".to_string(),
+        _ => {
+            let message = err.to_string();
+            match message.find(" (os error") {
+                Some(end) => message[..end].to_string(),
+                None => message,
+            }
+        }
+    }
+}
+
+/// Splits the screen into the editor, the output panel (when shown) and the bottom
+/// bar, `bottom` rows tall.
+fn layout(area: Rect, bottom: u16, with_output: bool) -> (Rect, Option<Rect>, Rect) {
+    let [main, bottom] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(bottom)]).areas(area);
+
+    if !with_output {
+        return (main, None, bottom);
+    }
+
+    let [editor, output] =
+        Layout::vertical([Constraint::Percentage(60), Constraint::Min(5)]).areas(main);
+    (editor, Some(output), bottom)
+}
+
+/// Puts the cursor at the end of the starter code's greeting line, ready to edit.
+fn starter_cursor(template: &str) -> usize {
+    let Some(start) = template.find("Hello") else {
+        return 0;
+    };
+    let end = template[start..]
+        .find('\n')
+        .map_or(template.len(), |end| start + end);
+    template[..end].chars().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runners::RUNNERS;
+
+    #[test]
+    fn starter_cursor_lands_after_the_greeting() {
+        let template = "fn main() {\n    println!(\"Hello, world!\");\n}\n";
+        let cursor = starter_cursor(template);
+        assert_eq!(
+            &template[..cursor],
+            "fn main() {\n    println!(\"Hello, world!\");"
+        );
+    }
+
+    #[test]
+    fn starter_cursor_counts_chars_not_bytes() {
+        assert_eq!(starter_cursor("é Hello\n"), 7);
+    }
+
+    #[test]
+    fn every_template_places_the_cursor_on_its_greeting_line() {
+        for runner in RUNNERS {
+            let cursor = starter_cursor(runner.template);
+            let before: String = runner.template.chars().take(cursor).collect();
+            let line = before.lines().last().unwrap_or_default();
+            assert!(line.contains("Hello, world!"), "{}", runner.name);
+        }
+    }
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = env::temp_dir().join(format!("scratch-test-{name}-{}", process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn python_editor() -> Editor {
+        let python = RUNNERS
+            .iter()
+            .find(|runner| runner.name == "Python")
+            .unwrap();
+        Editor::new(python, PathBuf::from("/usr/bin/python3")).unwrap()
+    }
+
+    #[test]
+    fn saving_creates_missing_folders_and_reports_the_topmost() {
+        let dir = TempDir::new("save-dirs");
+        let path = dir.0.join("a/b/c.py");
+
+        let created = write_creating_dirs(&path, "x").unwrap();
+        assert_eq!(created, Some(dir.0.join("a")));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "x");
+
+        // Nothing new to create the second time.
+        assert_eq!(write_creating_dirs(&path, "y").unwrap(), None);
+    }
+
+    #[test]
+    fn describes_common_save_errors_plainly() {
+        let dir = TempDir::new("save-errors");
+        let file = dir.0.join("file");
+        fs::write(&file, "").unwrap();
+
+        let under_file = write_creating_dirs(&file.join("x.py"), "").unwrap_err();
+        assert!(!describe_io_error(&under_file).contains("os error"));
+
+        let onto_dir = fs::write(&dir.0, "").unwrap_err();
+        assert_eq!(describe_io_error(&onto_dir), "that's a folder");
+    }
+
+    #[test]
+    fn save_targets_expand_home_and_folders() {
+        let editor = python_editor();
+        let dir = TempDir::new("save-targets");
+        let home = PathBuf::from(env::var_os("HOME").unwrap());
+
+        assert_eq!(editor.target_path("~/x.py").unwrap(), home.join("x.py"));
+        assert_eq!(
+            editor.target_path("new/").unwrap(),
+            Path::new("new/scratch.py")
+        );
+        assert_eq!(
+            editor.target_path(&dir.0.display().to_string()).unwrap(),
+            dir.0.join("scratch.py")
+        );
+        assert_eq!(
+            editor.target_path("'my file.py'").unwrap(),
+            Path::new("my file.py")
+        );
+    }
+
+    #[test]
+    fn save_targets_reject_several_paths() {
+        let editor = python_editor();
+        assert!(editor.target_path("my file.py").is_err());
+        assert!(editor.target_path("'unfinished").is_err());
     }
 }
