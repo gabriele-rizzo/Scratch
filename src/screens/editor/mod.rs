@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
@@ -249,6 +249,22 @@ impl Editor {
 
         let right = match self.toast.as_ref().filter(|toast| toast.is_visible()) {
             Some(toast) => toast.line(),
+            None if self.output.as_ref().is_some_and(Output::is_focused) => {
+                Line::from(ui::hints(&[
+                    ("enter", "send"),
+                    ("ctrl+d", "end input"),
+                    ("ctrl+c", "stop"),
+                    ("esc", "editor"),
+                ]))
+            }
+            None if self.output.as_ref().is_some_and(Output::is_running) => {
+                Line::from(ui::hints(&[
+                    ("ctrl+o", "input"),
+                    ("pgup/pgdn", "scroll"),
+                    ("esc", "commands"),
+                    ("ctrl+c", "quit"),
+                ]))
+            }
             None if self.output.is_some() => Line::from(ui::hints(&[
                 ("pgup/pgdn", "scroll"),
                 ("ctrl+r", "run"),
@@ -306,7 +322,10 @@ impl Screen for Editor {
             None => {
                 self.draw_status(frame, bottom_area);
 
+                let output_focused = self.output.as_ref().is_some_and(Output::is_focused);
+
                 if self.leaving.is_none()
+                    && !output_focused
                     && let Some((x, y)) = self.editor.get_visible_cursor(&self.editor_area)
                 {
                     frame.set_cursor_position(Position::new(x, y));
@@ -350,6 +369,32 @@ impl Screen for Editor {
                     }
                 }
             });
+        }
+
+        // While the output panel has focus, keys go to the program.
+        if let Some(output) = &mut self.output
+            && output.is_focused()
+            && let Event::Key(key) = &event
+        {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+            match key.code {
+                KeyCode::Char('c') if ctrl => output.interrupt(),
+                KeyCode::Char('d') if ctrl => output.end_input(),
+                KeyCode::Char('o') if ctrl => output.set_focus(false),
+                KeyCode::Esc => output.set_focus(false),
+                KeyCode::Enter => output.submit(),
+                // Handled below: scrolling, run and save.
+                KeyCode::PageUp | KeyCode::PageDown => {}
+                KeyCode::Char('r' | 's') if ctrl => {}
+                _ => output.input(*key),
+            }
+
+            let passthrough = matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+                || (ctrl && matches!(key.code, KeyCode::Char('r' | 's')));
+            if !passthrough {
+                return Ok(ScreenAction::None);
+            }
         }
 
         // ctrl+c copies when there's a selection, otherwise quits.
@@ -401,6 +446,7 @@ impl Screen for Editor {
                     match mouse.kind {
                         MouseEventKind::ScrollUp => output.scroll().up(MOUSE_SCROLL_LINES),
                         MouseEventKind::ScrollDown => output.scroll().down(MOUSE_SCROLL_LINES),
+                        MouseEventKind::Down(MouseButton::Left) => output.set_focus(true),
                         _ => {}
                     }
                     return Ok(ScreenAction::None);
@@ -415,6 +461,14 @@ impl Screen for Editor {
             }
             Event::Key(key)
                 if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('o') =>
+            {
+                if let Some(output) = &mut self.output {
+                    output.set_focus(true);
+                }
+            }
+            Event::Key(key)
+                if key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.code == KeyCode::Char('r') =>
             {
                 self.run()
@@ -426,7 +480,15 @@ impl Screen for Editor {
                 self.save("");
             }
             Event::Key(key) => self.editor.input(key, &self.editor_area)?,
-            Event::Mouse(mouse) => self.editor.mouse(mouse, &self.editor_area)?,
+            Event::Mouse(mouse) => {
+                if let MouseEventKind::Down(_) = mouse.kind
+                    && let Some(output) = &mut self.output
+                {
+                    output.set_focus(false);
+                }
+
+                self.editor.mouse(mouse, &self.editor_area)?
+            }
             // Event::Paste(value)
             _ => {}
         };

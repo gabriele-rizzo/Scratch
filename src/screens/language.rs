@@ -12,7 +12,7 @@ use ratatui::{
 use tuimon::{Screen, ScreenAction};
 
 use crate::{
-    runners::{self, RUNNERS, Runner},
+    runners::{self, Detection, RUNNERS, Runner},
     screens::Editor,
     ui::{
         self, ACCENT, CommandBar, CommandEvent, CommandSpec, ERROR, Input, InputView, MUTED,
@@ -31,13 +31,14 @@ const COMMANDS: &[CommandSpec] = &[CommandSpec {
 enum Status {
     Checking,
     Available(PathBuf),
-    Unavailable,
+    /// Why it can't be used, e.g. "not installed".
+    Unavailable(&'static str),
 }
 
 pub struct Language {
     statuses: Vec<Status>,
     /// Pending detection results; dropped once every runner has been checked.
-    detection: Option<Receiver<(usize, Option<PathBuf>)>>,
+    detection: Option<Receiver<(usize, Detection)>>,
     started: Instant,
     input: Input,
     command_bar: Option<CommandBar>,
@@ -75,8 +76,9 @@ impl Language {
 
         for (index, binary) in rx.try_iter() {
             self.statuses[index] = match binary {
-                Some(binary) => Status::Available(binary),
-                None => Status::Unavailable,
+                Detection::Found(binary) => Status::Available(binary),
+                Detection::Missing => Status::Unavailable("not installed"),
+                Detection::Placeholder(hint) => Status::Unavailable(hint),
             };
         }
 
@@ -191,10 +193,10 @@ impl Language {
                         Span::styled(name, Style::new().fg(TEXT).bold()),
                         Span::styled(binary.display().to_string(), Style::new().fg(MUTED)),
                     ]),
-                    Status::Unavailable => Line::from(vec![
+                    Status::Unavailable(reason) => Line::from(vec![
                         Span::styled("✗", Style::new().fg(ERROR).dim()),
                         Span::styled(name, Style::new().fg(MUTED)),
-                        Span::styled("not installed", Style::new().fg(MUTED).italic()),
+                        Span::styled(*reason, Style::new().fg(MUTED).italic()),
                     ]),
                 };
 

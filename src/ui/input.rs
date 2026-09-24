@@ -42,6 +42,12 @@ impl Input {
         self.cursor = self.value.chars().count();
     }
 
+    /// Display width of the text before the cursor.
+    pub fn cursor_width(&self) -> u16 {
+        let before: String = self.value.chars().take(self.cursor).collect();
+        Span::raw(before).width() as u16
+    }
+
     fn byte_index(&self, cursor: usize) -> usize {
         self.value
             .char_indices()
@@ -125,8 +131,7 @@ impl Input {
         );
 
         if view.enabled {
-            let before: String = self.value.chars().take(self.cursor).collect();
-            let x = inner.x + prompt_width + Span::raw(before).width() as u16;
+            let x = inner.x + prompt_width + self.cursor_width();
             frame.set_cursor_position(Position::new(x.min(inner.right()), inner.y));
         }
     }

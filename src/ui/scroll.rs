@@ -39,6 +39,11 @@ impl Scroll {
         self.offset = self.offset.saturating_add(lines);
     }
 
+    /// Jumps to the end and follows new lines again.
+    pub fn follow(&mut self) {
+        self.follow = true;
+    }
+
     pub fn page_up(&mut self) {
         self.up((self.viewport / 2).max(1));
     }
