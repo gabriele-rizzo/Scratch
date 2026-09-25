@@ -39,6 +39,14 @@ impl Scroll {
         self.offset = self.offset.saturating_add(lines);
     }
 
+    /// Moves the view up by `lines` after that many were removed from the top, so
+    /// the same content stays in view. Following views are unaffected.
+    pub fn shift(&mut self, lines: usize) {
+        if !self.follow {
+            self.offset = self.offset.saturating_sub(lines);
+        }
+    }
+
     /// Jumps to the end and follows new lines again.
     pub fn follow(&mut self) {
         self.follow = true;
@@ -104,6 +112,22 @@ mod tests {
         scroll.update(100, 10);
         scroll.follow();
         assert_eq!(scroll.update(120, 10), 110);
+    }
+
+    #[test]
+    fn shift_keeps_content_in_view_when_lines_are_dropped() {
+        let mut scroll = Scroll::default();
+        scroll.update(100, 10);
+        scroll.up(40);
+        scroll.update(100, 10);
+        scroll.shift(15);
+        assert_eq!(scroll.update(100, 10), 35);
+
+        // A following view stays at the bottom.
+        let mut following = Scroll::default();
+        following.update(100, 10);
+        following.shift(15);
+        assert_eq!(following.update(100, 10), 90);
     }
 
     #[test]

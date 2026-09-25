@@ -22,11 +22,35 @@ fn expand_home_in(path: &str, home: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Shows `path` with the home directory abbreviated to `~`.
-pub fn display_home(path: &Path) -> String {
-    display_home_in(path, home().as_deref())
+/// Shows `path` for people: relative to the current folder when it's inside it,
+/// otherwise with the home directory abbreviated to `~`.
+pub fn display_path(path: &Path) -> String {
+    display_path_in(path, env::current_dir().ok().as_deref(), home().as_deref())
 }
 
+fn display_path_in(path: &Path, current: Option<&Path>, home: Option<&Path>) -> String {
+    match current.and_then(|current| path.strip_prefix(current).ok()) {
+        Some(rest) if !rest.as_os_str().is_empty() => rest.display().to_string(),
+        _ => display_home_in(path, home),
+    }
+}
+
+/// Shortens `text` to at most `width` characters by cutting from the start, e.g.
+/// `…/proj/main.rs`, so the end of a path stays visible.
+pub fn truncate_start(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    let tail: String = text.chars().skip(count - (width - 1)).collect();
+    format!("…{tail}")
+}
+
+/// Shows `path` with the home directory abbreviated to `~`.
 fn display_home_in(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
@@ -58,6 +82,37 @@ mod tests {
         // `~user` isn't supported, so it stays a plain name.
         assert_eq!(expand_home_in("~bob/x", home), Path::new("~bob/x"));
         assert_eq!(expand_home_in("~/x", None), Path::new("~/x"));
+    }
+
+    #[test]
+    fn shows_paths_relative_to_the_current_folder() {
+        let home = Some(Path::new(HOME));
+        let current = Some(Path::new("/home/me/proj"));
+
+        assert_eq!(
+            display_path_in(Path::new("/home/me/proj/src/a.rs"), current, home),
+            "src/a.rs"
+        );
+        assert_eq!(
+            display_path_in(Path::new("/home/me/other.rs"), current, home),
+            "~/other.rs"
+        );
+        assert_eq!(
+            display_path_in(Path::new("/home/me/proj"), current, home),
+            "~/proj"
+        );
+        assert_eq!(
+            display_path_in(Path::new("scratch.rs"), current, home),
+            "scratch.rs"
+        );
+    }
+
+    #[test]
+    fn truncates_from_the_start() {
+        assert_eq!(truncate_start("proj/main.rs", 20), "proj/main.rs");
+        assert_eq!(truncate_start("a/long/path/main.rs", 10), "…h/main.rs");
+        assert_eq!(truncate_start("abc", 1), "…");
+        assert_eq!(truncate_start("abc", 0), "");
     }
 
     #[test]

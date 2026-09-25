@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Clear, Padding, Paragraph},
 };
 
 use super::{ACCENT, MUTED, SUBTLE, TEXT};
@@ -19,6 +19,8 @@ pub enum UnsavedChoice {
 pub struct UnsavedPrompt {
     /// The file being left, e.g. `scratch.rs`.
     pub file: String,
+    /// What happens next, e.g. `leaving` or `opening another file`.
+    pub action: &'static str,
 }
 
 impl UnsavedPrompt {
@@ -36,7 +38,7 @@ impl UnsavedPrompt {
         let [area] = Layout::horizontal([Constraint::Length(width)])
             .flex(Flex::Center)
             .areas(area);
-        let [area] = Layout::vertical([Constraint::Length(7)])
+        let [area] = Layout::vertical([Constraint::Length(8)])
             .flex(Flex::Center)
             .areas(area);
 
@@ -55,15 +57,19 @@ impl UnsavedPrompt {
         let action = |action: &'static str| Span::styled(action, Style::new().fg(SUBTLE));
         let gap = || Span::styled("   ", Style::new().fg(MUTED));
 
+        // Borders and padding take 6 columns; the file gets what's left of its line.
+        let intro = "Save changes to ";
+        let room = usize::from(width).saturating_sub(6 + intro.len());
+
         let body = vec![
             Line::from(vec![
-                Span::styled("Save changes to ", Style::new().fg(TEXT)),
+                Span::styled(intro, Style::new().fg(TEXT)),
                 Span::styled(
-                    self.file.as_str(),
+                    crate::utils::truncate_start(&self.file, room),
                     Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" before leaving?", Style::new().fg(TEXT)),
             ]),
+            Line::styled(format!("before {}?", self.action), Style::new().fg(TEXT)),
             Line::default(),
             Line::from(vec![
                 key("s"),
@@ -78,9 +84,6 @@ impl UnsavedPrompt {
         ];
 
         frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
-            area,
-        );
+        frame.render_widget(Paragraph::new(body).block(block), area);
     }
 }

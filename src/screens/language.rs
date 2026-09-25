@@ -21,12 +21,20 @@ use crate::{
     utils,
 };
 
-const COMMANDS: &[CommandSpec] = &[CommandSpec {
-    name: "exit",
-    args: "",
-    description: "Quit Scratch",
-    keys: "ctrl+c",
-}];
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "open",
+        args: "<path>",
+        description: "Open a file",
+        keys: "",
+    },
+    CommandSpec {
+        name: "exit",
+        args: "",
+        description: "Quit Scratch",
+        keys: "ctrl+c",
+    },
+];
 
 enum Status {
     Checking,
@@ -128,8 +136,15 @@ impl Language {
         Ok(ScreenAction::Push(Box::new(editor)))
     }
 
-    fn execute(&mut self, name: &str) -> ScreenAction {
+    fn execute(&mut self, name: &str, args: &str) -> ScreenAction {
         match name {
+            "open" => match Editor::open(args, None) {
+                Ok(editor) => ScreenAction::Push(Box::new(editor)),
+                Err(err) => {
+                    self.toast = Some(Toast::error(format!("Couldn't open {err}")));
+                    ScreenAction::None
+                }
+            },
             "exit" => ScreenAction::Quit,
             _ => ScreenAction::None,
         }
@@ -344,9 +359,9 @@ impl Screen for Language {
                     self.command_bar = None;
                     ScreenAction::None
                 }
-                CommandEvent::Submit { name, .. } => {
+                CommandEvent::Submit { name, args } => {
                     self.command_bar = None;
-                    self.execute(name)
+                    self.execute(name, &args)
                 }
                 CommandEvent::Unknown(name) => {
                     self.command_bar = None;

@@ -5,7 +5,7 @@ use std::{
     thread,
 };
 
-use super::RUNNERS;
+use super::{RUNNERS, Runner};
 
 pub enum Detection {
     Found(PathBuf),
@@ -35,6 +35,14 @@ pub fn detect() -> Receiver<(usize, Detection)> {
     });
 
     rx
+}
+
+/// Checks one runner right away; it only stats files, so it's cheap enough to
+/// call on demand.
+pub fn detect_one(runner: &Runner) -> Detection {
+    let path = env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = env::split_paths(&path).collect();
+    detect_runner(&dirs, runner.binaries)
 }
 
 fn detect_runner(dirs: &[PathBuf], binaries: &[&str]) -> Detection {

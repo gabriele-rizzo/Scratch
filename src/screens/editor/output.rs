@@ -1,4 +1,4 @@
-use std::{borrow::Cow, path::Path, process::ExitStatus};
+use std::{borrow::Cow, collections::VecDeque, path::Path, process::ExitStatus};
 
 use ansi_to_tui::IntoText;
 use crossterm::event::KeyEvent;
@@ -14,17 +14,13 @@ use ratatui::{
 };
 
 use crate::{
-    runners::{Process, RunStatus, TerminalSize},
+    runners::{Process, RunStatus, SCROLLBACK, TerminalSize},
     ui::{self, ACCENT, ERROR, Input, MUTED, SUBTLE, SUCCESS, SURFACE, Scroll, TEXT},
 };
 
 enum Run {
     /// `workdir` is hidden from output so paths read as `main.<ext>`.
-    Started {
-        process: Process,
-        workdir: String,
-        rendered: Vec<Line<'static>>,
-    },
+    Started { process: Process, workdir: String },
     /// The program couldn't be started at all.
     Failed { title: String, detail: String },
 }
@@ -34,7 +30,7 @@ enum Run {
 #[derive(Default)]
 struct RowCache {
     width: usize,
-    counts: Vec<usize>,
+    counts: VecDeque<usize>,
     total: usize,
 }
 
@@ -46,9 +42,17 @@ pub struct Output {
     input: Input,
     /// Whether keys go to the program instead of the editor.
     focused: bool,
+    /// Whether the top border is being dragged to resize the panel.
+    resizing: bool,
     /// The program's arguments, shown in the title.
     args: String,
     rows: RowCache,
+    /// Output lines, parsed once as they arrive; the last `SCROLLBACK` of them.
+    rendered: VecDeque<Line<'static>>,
+    /// How many of the program's lines have been taken into `rendered`.
+    seen: usize,
+    /// How many lines were dropped (or skipped) to stay within `SCROLLBACK`.
+    discarded: usize,
     /// Where the panel was last drawn, for mouse hit-testing.
     pub area: Rect,
 }
@@ -58,7 +62,6 @@ impl Output {
         let mut output = Self::new(Run::Started {
             process,
             workdir: format!("{}/", workdir.display()),
-            rendered: Vec::new(),
         });
         output.args = crate::utils::join_args(args);
         output
@@ -77,8 +80,12 @@ impl Output {
             scroll: Scroll::default(),
             input: Input::default(),
             focused: false,
+            resizing: false,
             args: String::new(),
             rows: RowCache::default(),
+            rendered: VecDeque::new(),
+            seen: 0,
+            discarded: 0,
             area: Rect::default(),
         }
     }
@@ -103,6 +110,10 @@ impl Output {
 
     pub fn is_running(&self) -> bool {
         self.process().is_some_and(Process::is_running)
+    }
+
+    pub fn set_resizing(&mut self, resizing: bool) {
+        self.resizing = resizing;
     }
 
     pub fn is_focused(&self) -> bool {
@@ -159,16 +170,36 @@ impl Output {
     }
 
     pub fn poll(&mut self) {
-        if let Run::Started {
-            process,
-            workdir,
-            rendered,
-        } = &mut self.run
-        {
+        if let Run::Started { process, workdir } = &mut self.run {
             process.poll();
 
-            let new = &process.lines[rendered.len()..];
-            rendered.extend(new.iter().map(|raw| render_line(raw, workdir)));
+            // Render only the new lines that will still be kept.
+            let total = process.dropped + process.lines.len();
+            let first = self
+                .seen
+                .max(process.dropped)
+                .max(total.saturating_sub(SCROLLBACK));
+            self.discarded += first - self.seen;
+            for index in first..total {
+                let raw = &process.lines[index - process.dropped];
+                self.rendered.push_back(render_line(raw, workdir));
+            }
+            self.seen = total;
+
+            let mut removed_rows = 0;
+            while self.rendered.len() > SCROLLBACK {
+                self.rendered.pop_front();
+                self.discarded += 1;
+
+                // `counts` covers a prefix of `rendered`, so its front is this line.
+                if let Some(count) = self.rows.counts.pop_front() {
+                    self.rows.total -= count;
+                    removed_rows += count;
+                }
+            }
+
+            // Keep the same lines in view when scrolled back.
+            self.scroll.shift(removed_rows);
         }
 
         if !self.is_running() {
@@ -243,12 +274,14 @@ impl Output {
         }
     }
 
-    /// Output lines, parsed once as they arrive.
-    fn rendered(&self) -> &[Line<'static>] {
-        match &self.run {
-            Run::Started { rendered, .. } => rendered,
-            Run::Failed { .. } => &[],
-        }
+    /// Notes lines dropped to stay within the scrollback.
+    fn discarded_note(&self) -> Option<Line<'static>> {
+        (self.discarded > 0).then(|| {
+            Line::styled(
+                format!("… {} earlier lines not kept", thousands(self.discarded)),
+                Style::new().fg(MUTED).add_modifier(Modifier::ITALIC),
+            )
+        })
     }
 
     /// Lines shown after the program's output: a placeholder, the exit summary, or
@@ -308,14 +341,9 @@ impl Output {
             };
         }
 
-        let rendered = match &self.run {
-            Run::Started { rendered, .. } => rendered.as_slice(),
-            Run::Failed { .. } => &[],
-        };
-
-        for line in &rendered[rows.counts.len()..] {
+        for line in self.rendered.iter().skip(rows.counts.len()) {
             let count = ui::row_count(line, width);
-            rows.counts.push(count);
+            rows.counts.push_back(count);
             rows.total += count;
         }
     }
@@ -332,7 +360,11 @@ impl Output {
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.area = area;
 
-        let border = if self.focused { ACCENT } else { MUTED };
+        let border = if self.focused || self.resizing {
+            ACCENT
+        } else {
+            MUTED
+        };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(border))
@@ -362,6 +394,9 @@ impl Output {
         let width = content.width as usize;
         self.update_row_counts(width);
 
+        let note = self.discarded_note();
+        let note_count = note.as_ref().map_or(0, |line| ui::row_count(line, width));
+
         let partial = self.partial();
         let extra: Vec<Line<'static>> = partial
             .iter()
@@ -374,7 +409,7 @@ impl Output {
             .collect();
 
         // Everything below counts wrapped rows, not lines.
-        let total = self.rows.total + extra_counts.iter().sum::<usize>();
+        let total = note_count + self.rows.total + extra_counts.iter().sum::<usize>();
         let viewport = content.height as usize;
         let offset = self.scroll.update(total, viewport);
 
@@ -393,10 +428,10 @@ impl Output {
         frame.render_widget(block, area);
 
         // Only the visible lines are wrapped and cloned, however long the output gets.
-        let lines = self
-            .rendered()
+        let lines = note
             .iter()
-            .zip(self.rows.counts.iter().copied())
+            .zip([note_count])
+            .chain(self.rendered.iter().zip(self.rows.counts.iter().copied()))
             .chain(extra.iter().zip(extra_counts));
 
         let mut skip = offset;
@@ -496,6 +531,21 @@ impl Exit {
     }
 }
 
+/// Formats a count with thousands separators, e.g. `12,345`.
+fn thousands(count: usize) -> String {
+    let digits = count.to_string();
+    let mut formatted = String::new();
+
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+
+    formatted
+}
+
 /// Parses one line of program output, keeping the program's own ANSI colors. Plain
 /// compiler-style `error`/`warning` lines are emphasized.
 fn render_line(raw: &str, workdir: &str) -> Line<'static> {
@@ -536,6 +586,14 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn formats_thousands() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
     #[test]
@@ -612,7 +670,7 @@ mod tests {
         fn wraps_long_lines_inside_the_panel() {
             let mut output = run(&format!("echo {}", "a".repeat(80)));
             wait_for(&mut output, |output| {
-                !output.is_running() && !output.rendered().is_empty()
+                !output.is_running() && !output.rendered.is_empty()
             });
 
             let screen = draw(&mut output);
@@ -624,17 +682,36 @@ mod tests {
         }
 
         #[test]
+        fn notes_lines_dropped_from_scrollback() {
+            let mut output = run(&format!("seq 1 {}", SCROLLBACK + 250));
+            wait_for(&mut output, |output| {
+                !output.is_running() && output.seen == SCROLLBACK + 250
+            });
+
+            assert_eq!(output.rendered.len(), SCROLLBACK);
+            assert_eq!(output.discarded, 250);
+
+            output.scroll.up(usize::MAX);
+            let screen = draw(&mut output);
+            assert!(
+                screen[1].contains("… 250 earlier lines not kept"),
+                "{screen:?}"
+            );
+            assert!(screen[2].contains("251"), "{screen:?}");
+        }
+
+        #[test]
         fn starting_size_matches_the_drawn_panel() {
             // If they differed, the first frame would resize and signal the program.
             let mut output =
                 run("trap 'echo winch' WINCH; echo ready; while :; do sleep 0.05; done");
-            wait_for(&mut output, |output| !output.rendered().is_empty());
+            wait_for(&mut output, |output| !output.rendered.is_empty());
 
             draw(&mut output);
             thread::sleep(Duration::from_millis(200));
             output.poll();
 
-            let lines: Vec<String> = output.rendered().iter().map(text).collect();
+            let lines: Vec<String> = output.rendered.iter().map(text).collect();
             assert_eq!(lines, ["ready"]);
         }
     }

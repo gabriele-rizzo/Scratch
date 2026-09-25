@@ -1,10 +1,27 @@
 use std::{
+    collections::VecDeque,
     io::{self, Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, SyncSender},
     thread,
     time::{Duration, Instant},
 };
+
+/// Lines kept for scrollback; older ones are dropped, like a terminal.
+pub const SCROLLBACK: usize = 10_000;
+
+/// Output chunks in flight between the reader thread and the UI. When the UI falls
+/// behind, the reader waits, the terminal's buffer fills, and the program pauses on
+/// its next write, just like with a slow terminal.
+const CHANNEL_CHUNKS: usize = 16;
+
+/// How long one `poll` may spend on output, so the UI stays responsive however
+/// fast the program prints.
+const POLL_BUDGET: Duration = Duration::from_millis(10);
+
+/// A line longer than this without a newline is cut, so a program printing forever
+/// without one can't grow memory without bound.
+const MAX_LINE_BYTES: usize = 16 * 1024;
 
 /// The dimensions of the program's terminal, in cells.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,8 +63,11 @@ pub struct Process {
     input: Option<Box<dyn Write + Send>>,
     /// Output after the last newline, such as a prompt waiting for input.
     pending: Vec<u8>,
-    /// Complete output lines, possibly containing ANSI escape codes.
-    pub lines: Vec<String>,
+    /// The last `SCROLLBACK` complete output lines, possibly containing ANSI
+    /// escape codes.
+    pub lines: VecDeque<String>,
+    /// How many lines were dropped from the front of `lines`.
+    pub dropped: usize,
     interrupted: bool,
     terminal: Option<Terminal>,
     size: TerminalSize,
@@ -81,7 +101,7 @@ impl Process {
             Some(Box::new(stdin) as Box<dyn Write + Send>)
         });
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(CHANNEL_CHUNKS);
         forward(channel.reader, tx);
 
         Ok(Self {
@@ -89,7 +109,8 @@ impl Process {
             output: rx,
             input,
             pending: Vec::new(),
-            lines: Vec::new(),
+            lines: VecDeque::new(),
+            dropped: 0,
             interrupted: false,
             terminal: channel.terminal,
             size,
@@ -102,9 +123,14 @@ impl Process {
         matches!(self.status, RunStatus::Running)
     }
 
-    /// Collects new output and checks whether the program has exited.
+    /// Collects new output (for at most `POLL_BUDGET`) and checks whether the
+    /// program has exited.
     pub fn poll(&mut self) {
-        while let Ok(chunk) = self.output.try_recv() {
+        let deadline = Instant::now() + POLL_BUDGET;
+
+        while Instant::now() < deadline
+            && let Ok(chunk) = self.output.try_recv()
+        {
             self.push_output(&chunk);
         }
 
@@ -118,9 +144,28 @@ impl Process {
     fn push_output(&mut self, bytes: &[u8]) {
         self.pending.extend_from_slice(bytes);
 
-        while let Some(end) = self.pending.iter().position(|&byte| byte == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            self.lines.push(clean(&String::from_utf8_lossy(&line)));
+        // Split off every complete line, then remove them from `pending` at once.
+        let mut start = 0;
+        while let Some(end) = self.pending[start..].iter().position(|&byte| byte == b'\n') {
+            let line = clean(&String::from_utf8_lossy(&self.pending[start..=start + end]));
+            self.push_line(line);
+            start += end + 1;
+        }
+        self.pending.drain(..start);
+
+        if self.pending.len() > MAX_LINE_BYTES {
+            let cut = complete_utf8_len(&self.pending[..MAX_LINE_BYTES]);
+            let line: Vec<u8> = self.pending.drain(..cut).collect();
+            self.push_line(clean(&String::from_utf8_lossy(&line)));
+        }
+    }
+
+    fn push_line(&mut self, line: String) {
+        self.lines.push_back(line);
+
+        if self.lines.len() > SCROLLBACK {
+            self.lines.pop_front();
+            self.dropped += 1;
         }
     }
 
@@ -329,7 +374,7 @@ fn set_size(terminal: &Terminal, size: TerminalSize) {
     unsafe { libc::ioctl(terminal.as_raw_fd(), libc::TIOCSWINSZ, &size) };
 }
 
-fn forward(mut reader: Box<dyn Read + Send>, tx: Sender<Vec<u8>>) {
+fn forward(mut reader: Box<dyn Read + Send>, tx: SyncSender<Vec<u8>>) {
     thread::spawn(move || {
         let mut buffer = [0; 4096];
 
@@ -578,5 +623,46 @@ mod process_tests {
         thread::sleep(Duration::from_millis(200));
         process.poll();
         assert_eq!(process.lines, ["ready"]);
+    }
+
+    #[test]
+    fn keeps_only_the_last_scrollback_lines() {
+        let mut process = sh(&format!("seq 1 {}", SCROLLBACK + 500));
+        wait_for(&mut process, |p| {
+            !p.is_running() && p.dropped + p.lines.len() == SCROLLBACK + 500
+        });
+
+        assert_eq!(process.lines.len(), SCROLLBACK);
+        assert_eq!(process.dropped, 500);
+        assert_eq!(process.lines[0], "501");
+    }
+
+    #[test]
+    fn cuts_endless_lines() {
+        let mut process = sh("head -c 40000 /dev/zero | tr '\\0' x; echo");
+        wait_for(&mut process, |p| {
+            !p.is_running() && p.lines.iter().map(String::len).sum::<usize>() == 40000
+        });
+
+        assert!(
+            process
+                .lines
+                .iter()
+                .all(|line| line.len() <= MAX_LINE_BYTES)
+        );
+        assert_eq!(process.lines.len(), 3);
+    }
+
+    #[test]
+    fn a_flood_of_output_does_not_block_polling() {
+        let mut process = sh("yes");
+        wait_for(&mut process, |p| !p.lines.is_empty());
+
+        // Each poll stops after its budget, however fast `yes` prints.
+        let started = Instant::now();
+        for _ in 0..20 {
+            process.poll();
+        }
+        assert!(started.elapsed() < POLL_BUDGET * 20 + Duration::from_millis(500));
     }
 }

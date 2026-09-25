@@ -101,6 +101,31 @@ pub const RUNNERS: &[Runner] = &[
     },
 ];
 
+/// Other extensions for a runner's language, as `(extension, runner extension)`.
+const EXTENSION_ALIASES: &[(&str, &str)] = &[
+    ("pyw", "py"),
+    ("mjs", "js"),
+    ("cjs", "js"),
+    ("mts", "ts"),
+    ("h", "c"),
+    ("cc", "cpp"),
+    ("cxx", "cpp"),
+    ("hh", "cpp"),
+    ("hpp", "cpp"),
+    ("bash", "sh"),
+];
+
+/// The runner for a file, going by its extension.
+pub fn for_path(path: &Path) -> Option<&'static Runner> {
+    let extension = path.extension()?.to_str()?.to_lowercase();
+    let extension = EXTENSION_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == extension)
+        .map_or(extension.as_str(), |(_, target)| target);
+
+    RUNNERS.iter().find(|runner| runner.extension == extension)
+}
+
 /// `binary file`
 fn interpret(binary: &Path, file: &Path) -> Command {
     let mut command = Command::new(binary);
@@ -193,5 +218,18 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             "[one]\n[two words]\n[]\n"
         );
+    }
+
+    #[test]
+    fn finds_runners_by_extension_and_alias() {
+        let name = |path: &str| for_path(Path::new(path)).map(|runner| runner.name);
+
+        assert_eq!(name("a/main.rs"), Some("Rust"));
+        assert_eq!(name("x.PY"), Some("Python"));
+        assert_eq!(name("lib.hpp"), Some("C++"));
+        assert_eq!(name("util.h"), Some("C"));
+        assert_eq!(name("app.mjs"), Some("JavaScript"));
+        assert_eq!(name("notes.txt"), None);
+        assert_eq!(name("Makefile"), None);
     }
 }
