@@ -512,6 +512,8 @@ impl Output {
 
 enum Exit {
     Code(i32),
+    // Only detected on Unix, where programs die by signal.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Interrupted,
     Killed,
 }

@@ -69,6 +69,8 @@ pub struct Process {
     /// How many lines were dropped from the front of `lines`.
     pub dropped: usize,
     interrupted: bool,
+    // Only used to resize ptys, which exist on Unix.
+    #[cfg_attr(not(unix), allow(dead_code))]
     terminal: Option<Terminal>,
     size: TerminalSize,
     pub started: Instant,
@@ -292,13 +294,15 @@ impl Channel {
         let mut size = winsize(size);
 
         // SAFETY: all pointers are valid for the call; the name and termios are optional.
+        // `size` is passed as a raw pointer because it's `*mut` on macOS and `*const`
+        // on Linux.
         let result = unsafe {
             libc::openpty(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                &raw mut size,
             )
         };
         if result != 0 {

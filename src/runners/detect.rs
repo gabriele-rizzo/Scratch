@@ -184,6 +184,8 @@ mod tests {
             Self(dir)
         }
 
+        // Windows has no executable bit, so `executable` only matters on Unix.
+        #[cfg_attr(not(unix), allow(unused_variables))]
         fn file(&self, name: &str, executable: bool) -> PathBuf {
             let path = self.0.join(name);
             fs::write(&path, "#!/bin/sh\n").unwrap();

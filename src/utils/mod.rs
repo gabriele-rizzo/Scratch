@@ -9,3 +9,6 @@ pub use args::*;
 
 mod path;
 pub use path::*;
+
+mod complete;
+pub use complete::*;

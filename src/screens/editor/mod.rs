@@ -57,48 +57,63 @@ const COMMANDS: &[CommandSpec] = &[
         args: "[args]",
         description: "Run the file with arguments",
         keys: "ctrl+r",
+        paths: false,
     },
     CommandSpec {
         name: "save",
         args: "[path]",
         description: "Save the file",
         keys: "ctrl+s",
+        paths: true,
     },
     CommandSpec {
         name: "open",
         args: "<path>",
         description: "Open a file",
         keys: "",
+        paths: true,
     },
     CommandSpec {
         name: "new",
         args: "",
         description: "Start over from the starter code",
         keys: "",
+        paths: false,
+    },
+    CommandSpec {
+        name: "panel",
+        args: "[percent|+|-]",
+        description: "Resize the output panel",
+        keys: "ctrl/alt+↑↓",
+        paths: false,
     },
     CommandSpec {
         name: "zoom",
         args: "",
         description: "Toggle a full-height output panel",
-        keys: "ctrl+↑/↓",
+        keys: "",
+        paths: false,
     },
     CommandSpec {
         name: "clear",
         args: "",
         description: "Close the output panel",
         keys: "",
+        paths: false,
     },
     CommandSpec {
         name: "back",
         args: "",
         description: "Pick another language",
         keys: "",
+        paths: false,
     },
     CommandSpec {
         name: "exit",
         args: "",
         description: "Quit Scratch",
         keys: "ctrl+c",
+        paths: false,
     },
 ];
 
@@ -283,6 +298,10 @@ impl Editor {
                 Err(err) => self.toast = Some(Toast::error(format!("Couldn't open {err}"))),
             },
             "new" => return self.leave(Leave::New),
+            "panel" => match self.set_panel(args) {
+                Ok(message) => self.toast = Some(Toast::success(message)),
+                Err(err) => self.toast = Some(Toast::error(err)),
+            },
             "zoom" => match self.output {
                 Some(_) => self.panel.zoomed = !self.panel.zoomed,
                 None => self.toast = Some(Toast::error("Nothing to zoom; run the file first")),
@@ -501,6 +520,31 @@ impl Editor {
         self.panel.zoomed = false;
     }
 
+    /// `panel [percent|+|-]`: sets or steps the panel's size, or reports it.
+    fn set_panel(&mut self, args: &str) -> Result<String, String> {
+        match args.trim() {
+            "" => {}
+            "+" => self.resize_panel(1),
+            "-" => self.resize_panel(-1),
+            percent => {
+                let percent = percent.trim_end_matches('%');
+                match percent.parse::<u16>() {
+                    Ok(percent) if (MIN_PANEL_PERCENT..=MAX_PANEL_PERCENT).contains(&percent) => {
+                        self.panel.percent = percent;
+                        self.panel.zoomed = false;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Use a size from {MIN_PANEL_PERCENT} to {MAX_PANEL_PERCENT}, + or -"
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(format!("Output panel: {}%", self.panel.percent))
+    }
+
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let mut left = vec![
             Span::styled(
@@ -616,6 +660,7 @@ impl Editor {
         };
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('c') if ctrl => output.interrupt(),
             KeyCode::Char('d') if ctrl => output.end_input(),
@@ -623,7 +668,7 @@ impl Editor {
             KeyCode::Esc => output.set_focus(false),
             KeyCode::Enter => output.submit(),
             KeyCode::PageUp | KeyCode::PageDown => return None,
-            KeyCode::Up | KeyCode::Down if ctrl => return None,
+            KeyCode::Up | KeyCode::Down if ctrl || alt => return None,
             KeyCode::Char('r' | 's') if ctrl => return None,
             _ => output.input(*key),
         }
@@ -732,6 +777,8 @@ impl Editor {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<ScreenAction> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Alt too, since macOS takes ctrl+↑/↓ for Mission Control.
+        let resize = ctrl || key.modifiers.contains(KeyModifiers::ALT);
 
         match key.code {
             KeyCode::Esc => self.command_bar = Some(CommandBar::new(COMMANDS)),
@@ -744,8 +791,8 @@ impl Editor {
             KeyCode::Char('s') if ctrl => {
                 self.save("");
             }
-            KeyCode::Up if ctrl && self.output.is_some() => self.resize_panel(1),
-            KeyCode::Down if ctrl && self.output.is_some() => self.resize_panel(-1),
+            KeyCode::Up if resize && self.output.is_some() => self.resize_panel(1),
+            KeyCode::Down if resize && self.output.is_some() => self.resize_panel(-1),
             KeyCode::PageUp | KeyCode::PageDown if self.output.is_some() => {
                 if let Some(output) = &mut self.output {
                     match key.code {
@@ -1119,5 +1166,35 @@ mod tests {
         assert!(err(&dir.0.display().to_string()).contains("that's a folder"));
         assert_eq!(err(""), "give a path to open");
         assert!(err("a b").contains("give one path"));
+    }
+
+    #[test]
+    fn panel_command_sets_steps_and_reports_the_size() {
+        let mut editor = python_editor();
+
+        assert_eq!(editor.set_panel("").unwrap(), "Output panel: 40%");
+        assert_eq!(editor.set_panel("65").unwrap(), "Output panel: 65%");
+        assert_eq!(editor.set_panel("+").unwrap(), "Output panel: 75%");
+        assert_eq!(editor.set_panel("-").unwrap(), "Output panel: 65%");
+        assert_eq!(editor.set_panel("30%").unwrap(), "Output panel: 30%");
+
+        assert!(editor.set_panel("5").is_err());
+        assert!(editor.set_panel("big").is_err());
+        assert_eq!(editor.panel.percent, 30);
+    }
+
+    #[test]
+    fn alt_arrows_resize_the_panel_too() {
+        let mut editor = python_editor();
+        editor.output = Some(Output::failed("x", "y"));
+
+        editor
+            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+            .unwrap();
+        assert_eq!(editor.panel.percent, 50);
+        editor
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(editor.panel.percent, 40);
     }
 }

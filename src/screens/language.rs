@@ -27,12 +27,14 @@ const COMMANDS: &[CommandSpec] = &[
         args: "<path>",
         description: "Open a file",
         keys: "",
+        paths: true,
     },
     CommandSpec {
         name: "exit",
         args: "",
         description: "Quit Scratch",
         keys: "ctrl+c",
+        paths: false,
     },
 ];
 
