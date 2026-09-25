@@ -1,7 +1,9 @@
+use std::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Margin, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, List, ListItem, ListState},
@@ -46,6 +48,9 @@ pub struct CommandBar<T: 'static> {
     paths: Option<PathCompletion>,
     /// Whether a path match was picked with ↑↓ or Tab (so Enter uses it).
     picked: bool,
+    /// The popup's scroll position, kept between frames so it only scrolls once
+    /// the highlight leaves the visible rows.
+    offset: Cell<usize>,
 }
 
 impl<T> CommandBar<T> {
@@ -56,6 +61,7 @@ impl<T> CommandBar<T> {
             selected: 0,
             paths: None,
             picked: false,
+            offset: Cell::new(0),
         }
     }
 
@@ -102,6 +108,7 @@ impl<T> CommandBar<T> {
     /// Call after the text changes.
     fn changed(&mut self) {
         self.selected = 0;
+        self.offset.set(0);
         self.picked = false;
         self.paths = self.path_arg().map(PathCompletion::new);
     }
@@ -296,9 +303,44 @@ impl<T> CommandBar<T> {
             .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
             .highlight_style(Style::new().bg(SURFACE));
 
-        let mut state = ListState::default().with_selected(self.picked.then_some(self.selected));
+        let count = paths.entries.len();
+        self.render_list(
+            frame,
+            popup,
+            list,
+            count,
+            self.picked.then_some(self.selected),
+        );
+    }
+
+    /// Draws a popup list, keeping its scroll position and adding a scrollbar when
+    /// the items don't all fit.
+    fn render_list(
+        &self,
+        frame: &mut Frame,
+        popup: Rect,
+        list: List,
+        count: usize,
+        selected: Option<usize>,
+    ) {
+        let mut state = ListState::default()
+            .with_offset(self.offset.get())
+            .with_selected(selected);
+
         frame.render_widget(Clear, popup);
         frame.render_stateful_widget(list, popup, &mut state);
+        self.offset.set(state.offset());
+
+        // Between the corners of the right border.
+        let rows = usize::from(popup.height.saturating_sub(2));
+        super::scrollbar(
+            frame,
+            popup.inner(Margin::new(0, 1)),
+            count,
+            rows,
+            state.offset(),
+            SUBTLE,
+        );
     }
 
     fn render_suggestions(&self, frame: &mut Frame, area: Rect) {
@@ -360,9 +402,7 @@ impl<T> CommandBar<T> {
             .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
             .highlight_style(Style::new().bg(SURFACE));
 
-        let mut state = ListState::default().with_selected(Some(self.selected));
-        frame.render_widget(Clear, popup);
-        frame.render_stateful_widget(list, popup, &mut state);
+        self.render_list(frame, popup, list, suggestions.len(), Some(self.selected));
     }
 }
 
@@ -530,6 +570,91 @@ mod tests {
         let mut bar = CommandBar::new(SPECS);
         bar.paste("save a.rs\nrm -rf /");
         assert_eq!(bar.input.value(), "save a.rs");
+    }
+
+    mod scrolling {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        use super::*;
+
+        macro_rules! commands {
+            ($($name:literal),*) => {
+                &[$(CommandSpec {
+                    name: $name,
+                    args: "",
+                    description: "",
+                    keys: "",
+                    paths: false,
+                    run: nothing,
+                }),*]
+            };
+        }
+
+        const MANY: &[CommandSpec<()>] =
+            commands!("c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9");
+
+        /// Draws the bar (and its popup of 6 rows) and returns the screen's rows.
+        fn draw(bar: &CommandBar<()>) -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+            terminal
+                .draw(|frame| bar.render(frame, Rect::new(0, 17, 40, 3)))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            (0..20)
+                .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect()
+        }
+
+        fn press(bar: &mut CommandBar<()>, code: KeyCode) {
+            bar.handle(key(code));
+            draw(bar);
+        }
+
+        #[test]
+        fn scrolls_up_only_after_the_first_visible_item() {
+            let mut bar = CommandBar::new(MANY);
+            draw(&bar);
+            for _ in 0..9 {
+                press(&mut bar, KeyCode::Down);
+            }
+            // The last item is selected and the list is scrolled to the bottom.
+            assert_eq!((bar.selected, bar.offset.get()), (9, 4));
+
+            // Moving up within the visible rows doesn't scroll.
+            for selected in (4..9).rev() {
+                press(&mut bar, KeyCode::Up);
+                assert_eq!((bar.selected, bar.offset.get()), (selected, 4));
+            }
+
+            // Only moving past the first visible item does.
+            press(&mut bar, KeyCode::Up);
+            assert_eq!((bar.selected, bar.offset.get()), (3, 3));
+        }
+
+        #[test]
+        fn shows_a_scrollbar_only_when_items_overflow() {
+            let bar = CommandBar::new(MANY);
+            let screen = draw(&bar);
+            assert!(
+                screen[10..16].iter().any(|row| row.ends_with('┃')),
+                "{screen:#?}"
+            );
+
+            let short = CommandBar::new(SPECS);
+            let screen = draw(&short);
+            assert!(!screen.iter().any(|row| row.contains('┃')), "{screen:#?}");
+        }
+
+        #[test]
+        fn typing_starts_the_list_from_the_top() {
+            let mut bar = CommandBar::new(MANY);
+            draw(&bar);
+            for _ in 0..9 {
+                press(&mut bar, KeyCode::Down);
+            }
+            press(&mut bar, KeyCode::Char('c'));
+            assert_eq!((bar.selected, bar.offset.get()), (0, 0));
+        }
     }
 
     mod paths {

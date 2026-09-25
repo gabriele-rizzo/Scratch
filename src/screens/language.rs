@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     path::PathBuf,
     sync::mpsc::Receiver,
     time::{Duration, Instant},
@@ -69,6 +70,9 @@ pub struct Language {
     toast: Option<Toast>,
     /// Index into `matches()`.
     selected: usize,
+    /// The list's scroll position, kept between frames so it only scrolls once the
+    /// highlight leaves the visible rows.
+    list_offset: Cell<usize>,
     /// Each language's draft, as shown in the list.
     drafts: Vec<Option<String>>,
     /// Whether `drafts` may be out of date, after an editor was opened.
@@ -86,10 +90,17 @@ impl Language {
             command_bar: None,
             toast: None,
             selected: 0,
+            list_offset: Cell::new(0),
             drafts: Vec::new(),
             drafts_stale: true,
             help: None,
         }
+    }
+
+    /// Call when the filter changes: the list starts over from the top.
+    fn filter_changed(&mut self) {
+        self.selected = 0;
+        self.list_offset.set(0);
     }
 
     /// Rereads drafts; editors write them when they close.
@@ -163,7 +174,7 @@ impl Language {
 
         // Start from the full list when coming back from the editor.
         self.input.clear();
-        self.selected = 0;
+        self.filter_changed();
         self.drafts_stale = true;
 
         Ok(ScreenAction::Push(Box::new(editor)))
@@ -234,7 +245,9 @@ impl Language {
         // What's left for each program's path: the highlight, icon, name and draft
         // columns come first.
         let draft_columns = if draft_width > 0 { draft_width + 2 } else { 0 };
-        let path_width = usize::from(area.width).saturating_sub(3 + name_width + 4 + draft_columns);
+        // One more column is kept free for the scrollbar.
+        let path_width =
+            usize::from(area.width).saturating_sub(3 + name_width + 4 + draft_columns + 2);
 
         let items: Vec<ListItem> = visible
             .iter()
@@ -282,8 +295,20 @@ impl Language {
             .highlight_spacing(HighlightSpacing::Always)
             .highlight_style(Style::new().bg(SURFACE));
 
-        let mut state = ListState::default().with_selected(position);
+        let mut state = ListState::default()
+            .with_offset(self.list_offset.get())
+            .with_selected(position);
         frame.render_stateful_widget(list, area, &mut state);
+        self.list_offset.set(state.offset());
+
+        ui::scrollbar(
+            frame,
+            area,
+            visible.len(),
+            usize::from(area.height),
+            state.offset(),
+            SUBTLE,
+        );
     }
 
     /// The draft column for runner `index`, padded to `width` (empty when there's
@@ -475,7 +500,7 @@ impl Screen for Language {
                     Some(command_bar) => command_bar.paste(&text),
                     None => {
                         self.input.insert(utils::first_line(&text));
-                        self.selected = 0;
+                        self.filter_changed();
                     }
                 }
                 return Ok(ScreenAction::None);
@@ -513,13 +538,13 @@ impl Screen for Language {
             KeyCode::Enter => return self.select(),
             KeyCode::Esc => {
                 self.input.clear();
-                self.selected = 0;
+                self.filter_changed();
             }
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => self.selected += 1,
             _ => {
                 if self.input.handle(key) {
-                    self.selected = 0;
+                    self.filter_changed();
                 }
             }
         }

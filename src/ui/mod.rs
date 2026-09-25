@@ -25,8 +25,12 @@ pub use help::*;
 use std::time::{Duration, Instant};
 
 use ratatui::{
-    style::{Modifier, Style},
+    Frame,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    symbols::scrollbar,
     text::Span,
+    widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -36,6 +40,38 @@ pub const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 pub fn spinner(since: Instant) -> &'static str {
     let frame = since.elapsed().as_millis() / SPINNER_INTERVAL.as_millis();
     SPINNER[frame as usize % SPINNER.len()]
+}
+
+/// A slim scrollbar down `area` (usually just inside a panel's right border),
+/// drawn only when `total` rows don't fit in the `visible` ones.
+pub fn scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    total: usize,
+    visible: usize,
+    offset: usize,
+    thumb: Color,
+) {
+    if total <= visible {
+        return;
+    }
+
+    let mut state = ScrollbarState::new(total - visible)
+        .position(offset)
+        .viewport_content_length(visible);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .symbols(scrollbar::Set {
+            track: "│",
+            thumb: "┃",
+            begin: "",
+            end: "",
+        })
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_style(Style::new().fg(MUTED))
+        .thumb_style(Style::new().fg(thumb));
+
+    frame.render_stateful_widget(bar, area, &mut state);
 }
 
 /// Keyboard hints like `esc commands · ctrl+c quit`.

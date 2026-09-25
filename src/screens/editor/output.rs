@@ -6,11 +6,8 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Margin, Position, Rect},
     style::{Modifier, Style},
-    symbols::scrollbar,
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    },
+    widgets::{Block, BorderType, Padding, Paragraph},
 };
 
 use super::search::{self, Search};
@@ -643,24 +640,14 @@ impl Output {
             self.draw_input(frame, row);
         }
 
-        if total > viewport {
-            let mut state = ScrollbarState::new(total - viewport)
-                .position(offset)
-                .viewport_content_length(viewport);
-            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .symbols(scrollbar::Set {
-                    track: "│",
-                    thumb: "┃",
-                    begin: "",
-                    end: "",
-                })
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_style(Style::new().fg(MUTED))
-                .thumb_style(Style::new().fg(SUBTLE));
-
-            frame.render_stateful_widget(scrollbar, area.inner(Margin::new(0, 1)), &mut state);
-        }
+        ui::scrollbar(
+            frame,
+            area.inner(Margin::new(0, 1)),
+            total,
+            viewport,
+            offset,
+            SUBTLE,
+        );
     }
 
     fn draw_input(&self, frame: &mut Frame, area: Rect) {

@@ -3,15 +3,11 @@ use ratatui::{
     Frame,
     layout::{Constraint, Flex, Layout, Margin, Rect},
     style::{Modifier, Style},
-    symbols::scrollbar,
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState,
-    },
+    widgets::{Block, BorderType, Clear, Padding, Paragraph},
 };
 
-use super::{ACCENT, CommandSpec, MUTED, SUBTLE, TEXT};
+use super::{ACCENT, CommandSpec, SUBTLE, TEXT};
 
 /// Keys (or a command) and what they do.
 pub type HelpEntry = (String, String);
@@ -166,23 +162,14 @@ impl Help {
             area,
         );
 
-        if max > 0 {
-            let mut state = ScrollbarState::new(max)
-                .position(self.scroll)
-                .viewport_content_length(self.viewport);
-            let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .symbols(scrollbar::Set {
-                    track: "│",
-                    thumb: "┃",
-                    begin: "",
-                    end: "",
-                })
-                .begin_symbol(None)
-                .end_symbol(None)
-                .track_style(Style::new().fg(MUTED))
-                .thumb_style(Style::new().fg(ACCENT));
-            frame.render_stateful_widget(bar, area.inner(Margin::new(0, 1)), &mut state);
-        }
+        super::scrollbar(
+            frame,
+            area.inner(Margin::new(0, 1)),
+            lines.len(),
+            self.viewport,
+            self.scroll,
+            ACCENT,
+        );
     }
 }
 
