@@ -47,6 +47,12 @@ impl Scroll {
         }
     }
 
+    /// Shows the view from row `offset` and stops following new lines.
+    pub fn jump_to(&mut self, offset: usize) {
+        self.offset = offset;
+        self.follow = false;
+    }
+
     /// Jumps to the end and follows new lines again.
     pub fn follow(&mut self) {
         self.follow = true;

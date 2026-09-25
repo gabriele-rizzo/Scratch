@@ -432,7 +432,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1446,7 +1446,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1717,7 +1717,7 @@ dependencies = [
  "parking_lot",
  "rustix",
  "signal-hook",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2027,7 +2027,7 @@ dependencies = [
 [[package]]
 name = "tuimon"
 version = "0.1.0"
-source = "git+https://github.com/gabriele-rizzo/Tuimon.git#fb92f0c4ac7bd88cdd7de8ed8e40e0e58f305e09"
+source = "git+https://github.com/gabriele-rizzo/Tuimon.git#c149bfe576dccdd3c4d6bfa982784948ea525dee"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -2278,7 +2278,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

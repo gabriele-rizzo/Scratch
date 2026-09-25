@@ -99,6 +99,72 @@ pub const RUNNERS: &[Runner] = &[
         binaries: &["bash", "sh"],
         command: interpret,
     },
+    Runner {
+        name: "Ruby",
+        syntax: "ruby",
+        extension: "rb",
+        template: "puts \"Hello, world!\"\n",
+        binaries: &["ruby"],
+        command: interpret,
+    },
+    Runner {
+        name: "PHP",
+        syntax: "php",
+        extension: "php",
+        template: "<?php\n\necho \"Hello, world!\\n\";\n",
+        binaries: &["php"],
+        command: interpret,
+    },
+    Runner {
+        name: "Lua",
+        syntax: "lua",
+        extension: "lua",
+        template: "print(\"Hello, world!\")\n",
+        binaries: &["lua", "luajit"],
+        command: interpret,
+    },
+    Runner {
+        name: "Zig",
+        syntax: "zig",
+        extension: "zig",
+        // `std.debug.print` has stayed put while Zig's stdout API keeps changing.
+        template: "const std = @import(\"std\");\n\npub fn main() void {\n    std.debug.print(\"Hello, world!\\n\", .{});\n}\n",
+        binaries: &["zig"],
+        command: |binary, file| {
+            let mut command = Command::new(binary);
+            command.arg("run").arg(file);
+            command
+        },
+    },
+    Runner {
+        name: "Kotlin",
+        syntax: "kotlin",
+        // A script, so a scratch file doesn't need a class and `main`.
+        extension: "kts",
+        template: "println(\"Hello, world!\")\n",
+        binaries: &["kotlin", "kotlinc"],
+        command: |binary, file| {
+            let mut command = Command::new(binary);
+            if binary.file_name().is_some_and(|name| name == "kotlinc") {
+                command.arg("-script");
+            }
+            command.arg(file);
+            command
+        },
+    },
+    Runner {
+        name: "C#",
+        syntax: "c_sharp",
+        extension: "cs",
+        // Needs .NET 10 or later, which runs single files without a project.
+        template: "Console.WriteLine(\"Hello, world!\");\n",
+        binaries: &["dotnet"],
+        command: |binary, file| {
+            let mut command = Command::new(binary);
+            command.arg("run").arg(file);
+            command
+        },
+    },
 ];
 
 /// Other extensions for a runner's language, as `(extension, runner extension)`.
@@ -231,5 +297,23 @@ mod tests {
         assert_eq!(name("app.mjs"), Some("JavaScript"));
         assert_eq!(name("notes.txt"), None);
         assert_eq!(name("Makefile"), None);
+    }
+
+    #[test]
+    fn kotlin_scripts_run_with_either_binary() {
+        let kotlin = RUNNERS
+            .iter()
+            .find(|runner| runner.name == "Kotlin")
+            .unwrap();
+        let args = |binary: &str| {
+            let command = (kotlin.command)(Path::new(binary), Path::new("main.kts"));
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(args("/usr/bin/kotlin"), ["main.kts"]);
+        assert_eq!(args("/usr/bin/kotlinc"), ["-script", "main.kts"]);
     }
 }

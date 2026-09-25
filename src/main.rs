@@ -1,11 +1,5 @@
-use std::io;
-
 use anyhow::Result;
-use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
-    execute,
-};
-use tuimon::App;
+use tuimon::{App, MouseMode};
 
 mod runners;
 mod screens;
@@ -13,13 +7,9 @@ mod ui;
 mod utils;
 
 fn main() -> Result<()> {
-    // Ticks at the spinner's frame rate, which is also plenty for live output.
-    let mut app = App::new(screens::Language::new())?.with_tick_rate(ui::SPINNER_INTERVAL);
-
-    // Without this, a paste arrives as one key press per character.
-    execute!(io::stdout(), EnableBracketedPaste)?;
-    let result = app.run();
-    let _ = execute!(io::stdout(), DisableBracketedPaste);
-
-    result
+    // Clicks, drags and the wheel are all Scratch uses; plain movement would only
+    // cause redraws.
+    App::new(screens::Language::new())?
+        .with_mouse(MouseMode::ClickDrag)?
+        .run()
 }

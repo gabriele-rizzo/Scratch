@@ -19,6 +19,9 @@ pub use confirm::*;
 mod wrap;
 pub use wrap::*;
 
+mod help;
+pub use help::*;
+
 use std::time::{Duration, Instant};
 
 use ratatui::{

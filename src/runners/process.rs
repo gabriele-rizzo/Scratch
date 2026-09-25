@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io::{self, Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver, SyncSender},
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread,
     time::{Duration, Instant},
 };
@@ -18,6 +18,10 @@ const CHANNEL_CHUNKS: usize = 16;
 /// How long one `poll` may spend on output, so the UI stays responsive however
 /// fast the program prints.
 const POLL_BUDGET: Duration = Duration::from_millis(10);
+
+/// How long after exiting a program's output may still be arriving, e.g. from a
+/// background child that kept its terminal open.
+const SETTLE_TIME: Duration = Duration::from_secs(1);
 
 /// A line longer than this without a newline is cut, so a program printing forever
 /// without one can't grow memory without bound.
@@ -69,6 +73,8 @@ pub struct Process {
     /// How many lines were dropped from the front of `lines`.
     pub dropped: usize,
     interrupted: bool,
+    /// Whether the reader thread is done: all output has been received.
+    output_closed: bool,
     // Only used to resize ptys, which exist on Unix.
     #[cfg_attr(not(unix), allow(dead_code))]
     terminal: Option<Terminal>,
@@ -114,6 +120,7 @@ impl Process {
             lines: VecDeque::new(),
             dropped: 0,
             interrupted: false,
+            output_closed: false,
             terminal: channel.terminal,
             size,
             started: Instant::now(),
@@ -125,15 +132,31 @@ impl Process {
         matches!(self.status, RunStatus::Running)
     }
 
+    /// Whether nothing more will happen: the program exited and its output has all
+    /// arrived (or stopped arriving).
+    pub fn is_settled(&self) -> bool {
+        match &self.status {
+            RunStatus::Running => false,
+            RunStatus::Exited(_, elapsed) => {
+                self.output_closed || self.started.elapsed() > *elapsed + SETTLE_TIME
+            }
+        }
+    }
+
     /// Collects new output (for at most `POLL_BUDGET`) and checks whether the
     /// program has exited.
     pub fn poll(&mut self) {
         let deadline = Instant::now() + POLL_BUDGET;
 
-        while Instant::now() < deadline
-            && let Ok(chunk) = self.output.try_recv()
-        {
-            self.push_output(&chunk);
+        while Instant::now() < deadline {
+            match self.output.try_recv() {
+                Ok(chunk) => self.push_output(&chunk),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.output_closed = true;
+                    break;
+                }
+            }
         }
 
         if self.is_running()

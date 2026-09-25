@@ -1,7 +1,7 @@
 use std::{borrow::Cow, collections::VecDeque, path::Path, process::ExitStatus};
 
 use ansi_to_tui::IntoText;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Margin, Position, Rect},
@@ -13,9 +13,10 @@ use ratatui::{
     },
 };
 
+use super::search::{self, Search};
 use crate::{
     runners::{Process, RunStatus, SCROLLBACK, TerminalSize},
-    ui::{self, ACCENT, ERROR, Input, MUTED, SUBTLE, SUCCESS, SURFACE, Scroll, TEXT},
+    ui::{self, ACCENT, ERROR, Input, InputView, MUTED, SUBTLE, SUCCESS, SURFACE, Scroll, TEXT},
 };
 
 enum Run {
@@ -53,6 +54,8 @@ pub struct Output {
     seen: usize,
     /// How many lines were dropped (or skipped) to stay within `SCROLLBACK`.
     discarded: usize,
+    /// Finding text in the output, while the Find bar is open.
+    search: Option<Search>,
     /// Where the panel was last drawn, for mouse hit-testing.
     pub area: Rect,
 }
@@ -86,6 +89,7 @@ impl Output {
             rendered: VecDeque::new(),
             seen: 0,
             discarded: 0,
+            search: None,
             area: Rect::default(),
         }
     }
@@ -114,6 +118,100 @@ impl Output {
 
     pub fn set_resizing(&mut self, resizing: bool) {
         self.resizing = resizing;
+    }
+
+    /// Opens the Find bar, searching for `query`.
+    pub fn start_search(&mut self, query: &str) {
+        let mut search = Search::default();
+        search.input.set(query);
+        self.search = Some(search);
+        self.research();
+    }
+
+    pub fn is_searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Keys for the Find bar: typing searches, ↑↓ (or Enter and Shift+Enter)
+    /// move between matches, Esc closes it.
+    pub fn search_key(&mut self, key: KeyEvent) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        match key.code {
+            KeyCode::Esc => self.search = None,
+            KeyCode::Enter if shift => search.step(false),
+            KeyCode::Enter | KeyCode::Down => search.step(true),
+            KeyCode::Up => search.step(false),
+            _ => {
+                if search.input.handle(key) {
+                    self.research();
+                }
+            }
+        }
+    }
+
+    pub fn search_paste(&mut self, text: &str) {
+        if let Some(search) = &mut self.search {
+            search.input.insert(crate::utils::first_line(text));
+            self.research();
+        }
+    }
+
+    pub fn close_search(&mut self) {
+        self.search = None;
+    }
+
+    /// Searches every kept line again, starting from the newest match, which is
+    /// usually nearest what's in view.
+    fn research(&mut self) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+
+        search.matches = self
+            .rendered
+            .iter()
+            .enumerate()
+            .flat_map(|(index, line)| search.find(self.discarded + index, &line_text(line)))
+            .collect();
+        search.current = search.matches.len().saturating_sub(1);
+        search.jump = !search.matches.is_empty();
+    }
+
+    /// Draws the Find bar in `area` (3 rows).
+    pub fn draw_search(&self, frame: &mut Frame, area: Rect) {
+        let Some(search) = &self.search else { return };
+
+        let mut title = vec![Span::styled(
+            " Find ",
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )];
+        let counter = search.counter();
+        if !counter.is_empty() {
+            title.push(Span::styled(
+                format!("· {counter} "),
+                Style::new().fg(MUTED),
+            ));
+        }
+
+        search.input.render(
+            frame,
+            area,
+            InputView {
+                title: Line::from(title),
+                prompt: "/",
+                placeholder: "search the output",
+                enabled: true,
+            },
+        );
+    }
+
+    /// Whether the panel changes on its own and needs regular updates.
+    pub fn is_live(&self) -> bool {
+        self.process().is_some_and(|process| !process.is_settled())
     }
 
     pub fn is_focused(&self) -> bool {
@@ -182,7 +280,16 @@ impl Output {
             self.discarded += first - self.seen;
             for index in first..total {
                 let raw = &process.lines[index - process.dropped];
-                self.rendered.push_back(render_line(raw, workdir));
+                let line = render_line(raw, workdir);
+
+                // New lines are searched as they arrive.
+                if let Some(search) = &mut self.search {
+                    let number = self.discarded + self.rendered.len();
+                    search
+                        .matches
+                        .extend(search.find(number, &line_text(&line)));
+                }
+                self.rendered.push_back(line);
             }
             self.seen = total;
 
@@ -200,6 +307,10 @@ impl Output {
 
             // Keep the same lines in view when scrolled back.
             self.scroll.shift(removed_rows);
+
+            if let Some(search) = &mut self.search {
+                search.forget_before(self.discarded);
+            }
         }
 
         if !self.is_running() {
@@ -272,6 +383,34 @@ impl Output {
                 ])
             }
         }
+    }
+
+    /// The output as plain text (colors removed), or just its last `lines` lines.
+    /// Returns the text and how many lines it has.
+    pub fn plain_text(&self, lines: Option<usize>) -> (String, usize) {
+        let mut all: Vec<String> = self
+            .rendered
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        if let Some(partial) = self.partial() {
+            all.push(
+                partial
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect(),
+            );
+        }
+
+        let skip = lines.map_or(0, |lines| all.len().saturating_sub(lines));
+        let kept = &all[skip..];
+        (kept.join("\n"), kept.len())
     }
 
     /// Notes lines dropped to stay within the scrollback.
@@ -348,6 +487,34 @@ impl Output {
         }
     }
 
+    /// Scrolls so the current match sits mid-panel, once after it changes.
+    fn jump_to_match(&mut self, note_count: usize, width: usize, viewport: usize) {
+        let Some(search) = self.search.as_mut().filter(|search| search.jump) else {
+            return;
+        };
+        search.jump = false;
+        let Some(found) = search.current() else {
+            return;
+        };
+        let Some(position) = found.line.checked_sub(self.discarded) else {
+            return;
+        };
+
+        // Rows above the match's line, then its row within the line: wrapping the
+        // text up to and including its first character tells which row that is.
+        let above: usize = note_count + self.rows.counts.iter().take(position).sum::<usize>();
+        let text = self
+            .rendered
+            .get(position)
+            .map(line_text)
+            .unwrap_or_default();
+        let prefix: String = text.chars().take(found.start + 1).collect();
+        let within = ui::row_count(&Line::raw(prefix), width).saturating_sub(1);
+
+        self.scroll
+            .jump_to((above + within).saturating_sub(viewport / 2));
+    }
+
     /// The terminal size a running program gets in a panel drawn in `area`: inside
     /// the borders and padding, above the input row. Matches `draw`.
     pub fn terminal_size(area: Rect) -> TerminalSize {
@@ -393,6 +560,7 @@ impl Output {
 
         let width = content.width as usize;
         self.update_row_counts(width);
+        let viewport = content.height as usize;
 
         let note = self.discarded_note();
         let note_count = note.as_ref().map_or(0, |line| ui::row_count(line, width));
@@ -410,7 +578,7 @@ impl Output {
 
         // Everything below counts wrapped rows, not lines.
         let total = note_count + self.rows.total + extra_counts.iter().sum::<usize>();
-        let viewport = content.height as usize;
+        self.jump_to_match(note_count, width, viewport);
         let offset = self.scroll.update(total, viewport);
 
         let hidden_below = total.saturating_sub(offset + viewport);
@@ -428,11 +596,24 @@ impl Output {
         frame.render_widget(block, area);
 
         // Only the visible lines are wrapped and cloned, however long the output gets.
+        // Lines with matches are highlighted; the rest are shown as they are.
+        let search = self.search.as_ref();
+        let current = search.and_then(Search::current);
+        let rendered = self.rendered.iter().enumerate().map(|(index, line)| {
+            let matches = search.map_or(&[][..], |search| search.in_line(self.discarded + index));
+            if matches.is_empty() {
+                Cow::Borrowed(line)
+            } else {
+                Cow::Owned(search::highlight(line, matches, current))
+            }
+        });
+
         let lines = note
             .iter()
+            .map(Cow::Borrowed)
             .zip([note_count])
-            .chain(self.rendered.iter().zip(self.rows.counts.iter().copied()))
-            .chain(extra.iter().zip(extra_counts));
+            .chain(rendered.zip(self.rows.counts.iter().copied()))
+            .chain(extra.iter().map(Cow::Borrowed).zip(extra_counts));
 
         let mut skip = offset;
         let mut visible: Vec<Line> = Vec::with_capacity(viewport);
@@ -447,7 +628,12 @@ impl Output {
             }
 
             let remaining = viewport - visible.len();
-            visible.extend(ui::wrap(line, width).into_iter().skip(skip).take(remaining));
+            visible.extend(
+                ui::wrap(&line, width)
+                    .into_iter()
+                    .skip(skip)
+                    .take(remaining),
+            );
             skip = 0;
         }
 
@@ -531,6 +717,14 @@ impl Exit {
 
         Exit::Killed
     }
+}
+
+/// A line's text without its styling.
+fn line_text(line: &Line) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 /// Formats a count with thousands separators, e.g. `12,345`.
@@ -700,6 +894,19 @@ mod tests {
                 "{screen:?}"
             );
             assert!(screen[2].contains("251"), "{screen:?}");
+        }
+
+        #[test]
+        fn plain_text_drops_colors_and_can_keep_just_the_last_lines() {
+            let mut output = run("printf '\\033[31mred\\033[0m\\nb\\nunfinished'");
+            wait_for(&mut output, |output| !output.is_live());
+
+            assert_eq!(
+                output.plain_text(None),
+                ("red\nb\nunfinished".to_string(), 3)
+            );
+            assert_eq!(output.plain_text(Some(2)), ("b\nunfinished".to_string(), 2));
+            assert_eq!(output.plain_text(Some(99)).1, 3);
         }
 
         #[test]

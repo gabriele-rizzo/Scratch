@@ -22,8 +22,8 @@ use tuimon::{Screen, ScreenAction};
 use crate::{
     runners::{self, Detection, Process, Runner},
     ui::{
-        self, ACCENT, CommandBar, CommandEvent, CommandSpec, MUTED, ON_ACCENT, SUBTLE, Toast,
-        UnsavedChoice, UnsavedPrompt,
+        self, ACCENT, CommandBar, CommandEvent, CommandSpec, Help, HelpSection, MUTED, ON_ACCENT,
+        SUBTLE, Toast, UnsavedChoice, UnsavedPrompt,
     },
     utils,
 };
@@ -31,6 +31,7 @@ use crate::{
 mod draft;
 mod files;
 mod output;
+mod search;
 
 use draft::Draft;
 use files::{describe_io_error, write_creating_dirs};
@@ -51,13 +52,14 @@ const PANEL_STEP_PERCENT: u16 = 10;
 const MIN_OUTPUT_ROWS: u16 = 5;
 const MIN_EDITOR_ROWS: u16 = 3;
 
-const COMMANDS: &[CommandSpec] = &[
+const COMMANDS: &[CommandSpec<Editor>] = &[
     CommandSpec {
         name: "run",
         args: "[args]",
         description: "Run the file with arguments",
         keys: "ctrl+r",
         paths: false,
+        run: Editor::command_run,
     },
     CommandSpec {
         name: "save",
@@ -65,6 +67,7 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Save the file",
         keys: "ctrl+s",
         paths: true,
+        run: Editor::command_save,
     },
     CommandSpec {
         name: "open",
@@ -72,6 +75,7 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Open a file",
         keys: "",
         paths: true,
+        run: Editor::command_open,
     },
     CommandSpec {
         name: "new",
@@ -79,6 +83,7 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Start over from the starter code",
         keys: "",
         paths: false,
+        run: Editor::command_new,
     },
     CommandSpec {
         name: "panel",
@@ -86,6 +91,7 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Resize the output panel",
         keys: "ctrl/alt+↑↓",
         paths: false,
+        run: Editor::command_panel,
     },
     CommandSpec {
         name: "zoom",
@@ -93,6 +99,31 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Toggle a full-height output panel",
         keys: "",
         paths: false,
+        run: Editor::command_zoom,
+    },
+    CommandSpec {
+        name: "watch",
+        args: "",
+        description: "Rerun after every save",
+        keys: "",
+        paths: false,
+        run: Editor::command_watch,
+    },
+    CommandSpec {
+        name: "find",
+        args: "[text]",
+        description: "Search the output",
+        keys: "ctrl+f",
+        paths: false,
+        run: Editor::command_find,
+    },
+    CommandSpec {
+        name: "copy",
+        args: "[lines]",
+        description: "Copy the output (or its last lines)",
+        keys: "",
+        paths: false,
+        run: Editor::command_copy,
     },
     CommandSpec {
         name: "clear",
@@ -100,6 +131,15 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Close the output panel",
         keys: "",
         paths: false,
+        run: Editor::command_clear,
+    },
+    CommandSpec {
+        name: "help",
+        args: "",
+        description: "Show every key and command",
+        keys: "f1",
+        paths: false,
+        run: Editor::command_help,
     },
     CommandSpec {
         name: "back",
@@ -107,6 +147,7 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Pick another language",
         keys: "",
         paths: false,
+        run: Editor::command_back,
     },
     CommandSpec {
         name: "exit",
@@ -114,6 +155,7 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Quit Scratch",
         keys: "ctrl+c",
         paths: false,
+        run: Editor::command_exit,
     },
 ];
 
@@ -156,6 +198,8 @@ pub struct Editor {
     path: Option<PathBuf>,
     /// Arguments for the program; ctrl+r reuses the last ones.
     args: Vec<String>,
+    /// Whether saving also runs the file.
+    watch: bool,
     /// The file's text as last saved (or the starter code), to tell whether there
     /// are unsaved changes.
     saved: String,
@@ -168,10 +212,11 @@ pub struct Editor {
     panel: Panel,
     /// Whether the panel's top border is being dragged.
     resizing: bool,
-    command_bar: Option<CommandBar>,
+    command_bar: Option<CommandBar<Editor>>,
     toast: Option<Toast>,
     /// Shown when unsaved changes are about to be replaced.
     leaving: Option<(Leave, UnsavedPrompt)>,
+    help: Option<Help>,
 }
 
 impl Editor {
@@ -265,6 +310,7 @@ impl Editor {
             workdir,
             path,
             args: Vec::new(),
+            watch: false,
             saved: text.to_string(),
             saved_chars: text.chars().count(),
             dirty: false,
@@ -278,41 +324,147 @@ impl Editor {
             command_bar: None,
             toast: None,
             leaving: None,
+            help: None,
         })
     }
 
-    fn execute(&mut self, name: &str, args: &str) -> ScreenAction {
-        match name {
-            "run" => match utils::split_args(args) {
-                Ok(args) => {
-                    self.args = args;
-                    self.run();
-                }
-                Err(err) => self.toast = Some(Toast::error(format!("Couldn't run: {err}"))),
-            },
-            "save" => {
-                self.save(args);
+    fn command_run(&mut self, args: &str) -> ScreenAction {
+        match utils::split_args(args) {
+            Ok(args) => {
+                self.args = args;
+                self.run();
             }
-            "open" => match Self::open(args, Some(self.runner)) {
-                Ok(editor) => return self.leave(Leave::Open(Box::new(editor))),
-                Err(err) => self.toast = Some(Toast::error(format!("Couldn't open {err}"))),
+            Err(err) => self.toast = Some(Toast::error(format!("Couldn't run: {err}"))),
+        }
+        ScreenAction::None
+    }
+
+    fn command_save(&mut self, args: &str) -> ScreenAction {
+        self.save_and_watch(args);
+        ScreenAction::None
+    }
+
+    fn command_help(&mut self, _: &str) -> ScreenAction {
+        self.help = Some(Help::new(editor_help()));
+        ScreenAction::None
+    }
+
+    fn command_find(&mut self, args: &str) -> ScreenAction {
+        self.start_search(args);
+        ScreenAction::None
+    }
+
+    /// Opens the Find bar over the output, if there is any.
+    fn start_search(&mut self, query: &str) {
+        match &mut self.output {
+            Some(output) => output.start_search(query),
+            None => self.toast = Some(Toast::error("Nothing to search; run the file first")),
+        }
+    }
+
+    fn command_copy(&mut self, args: &str) -> ScreenAction {
+        self.toast = Some(match self.copy_output(args) {
+            Ok(message) => Toast::success(message),
+            Err(err) => Toast::error(err),
+        });
+        ScreenAction::None
+    }
+
+    /// Copies the output to the clipboard: the system one when available,
+    /// otherwise through the terminal (OSC 52), which also works over SSH.
+    fn copy_output(&mut self, args: &str) -> Result<String, String> {
+        let Some(output) = &self.output else {
+            return Err("Nothing to copy; run the file first".to_string());
+        };
+
+        let lines = match args.trim() {
+            "" => None,
+            count => match count.parse::<usize>() {
+                Ok(count) if count > 0 => Some(count),
+                _ => return Err("Give a number of lines, or nothing for all".to_string()),
             },
-            "new" => return self.leave(Leave::New),
-            "panel" => match self.set_panel(args) {
-                Ok(message) => self.toast = Some(Toast::success(message)),
-                Err(err) => self.toast = Some(Toast::error(err)),
-            },
-            "zoom" => match self.output {
-                Some(_) => self.panel.zoomed = !self.panel.zoomed,
-                None => self.toast = Some(Toast::error("Nothing to zoom; run the file first")),
-            },
-            "clear" => self.output = None,
-            "back" => return self.leave(Leave::Back),
-            "exit" => return self.leave(Leave::Quit),
-            _ => {}
+        };
+
+        let (text, count) = output.plain_text(lines);
+        if text.is_empty() {
+            return Err("There's no output to copy".to_string());
         }
 
+        let copied = match count {
+            1 => "Copied 1 line".to_string(),
+            count => format!("Copied {count} lines"),
+        };
+
+        if self.editor.set_clipboard(&text).is_ok() {
+            return Ok(copied);
+        }
+
+        use std::io::Write;
+        let mut stdout = std::io::stdout();
+        write!(stdout, "\x1b]52;c;{}\x07", utils::base64(text.as_bytes()))
+            .and_then(|_| stdout.flush())
+            .map_err(|err| format!("Couldn't copy: {}", describe_io_error(&err)))?;
+        Ok(format!("{copied} through the terminal"))
+    }
+
+    fn command_watch(&mut self, _: &str) -> ScreenAction {
+        self.watch = !self.watch;
+        self.toast = Some(Toast::success(if self.watch {
+            "Watching: saving runs the file"
+        } else {
+            "Stopped watching"
+        }));
         ScreenAction::None
+    }
+
+    /// Saves, then runs the file when watching.
+    fn save_and_watch(&mut self, args: &str) {
+        if self.save(args) && self.watch {
+            self.run();
+        }
+    }
+
+    fn command_open(&mut self, args: &str) -> ScreenAction {
+        match Self::open(args, Some(self.runner)) {
+            Ok(editor) => self.leave(Leave::Open(Box::new(editor))),
+            Err(err) => {
+                self.toast = Some(Toast::error(format!("Couldn't open {err}")));
+                ScreenAction::None
+            }
+        }
+    }
+
+    fn command_new(&mut self, _: &str) -> ScreenAction {
+        self.leave(Leave::New)
+    }
+
+    fn command_panel(&mut self, args: &str) -> ScreenAction {
+        self.toast = Some(match self.set_panel(args) {
+            Ok(message) => Toast::success(message),
+            Err(err) => Toast::error(err),
+        });
+        ScreenAction::None
+    }
+
+    fn command_zoom(&mut self, _: &str) -> ScreenAction {
+        match self.output {
+            Some(_) => self.panel.zoomed = !self.panel.zoomed,
+            None => self.toast = Some(Toast::error("Nothing to zoom; run the file first")),
+        }
+        ScreenAction::None
+    }
+
+    fn command_clear(&mut self, _: &str) -> ScreenAction {
+        self.output = None;
+        ScreenAction::None
+    }
+
+    fn command_back(&mut self, _: &str) -> ScreenAction {
+        self.leave(Leave::Back)
+    }
+
+    fn command_exit(&mut self, _: &str) -> ScreenAction {
+        self.leave(Leave::Quit)
     }
 
     /// Whether the buffer differs from its file. An untitled buffer never needs
@@ -554,6 +706,14 @@ impl Editor {
             Span::raw(" "),
         ];
 
+        if self.watch {
+            left.push(Span::styled(
+                " watch ",
+                Style::new().fg(ON_ACCENT).bg(SUBTLE).bold(),
+            ));
+            left.push(Span::raw(" "));
+        }
+
         let right = match self.toast.as_ref().filter(|toast| toast.is_visible()) {
             Some(toast) => toast.line(),
             None if self.output.as_ref().is_some_and(Output::is_focused) => {
@@ -582,7 +742,7 @@ impl Editor {
                 ("ctrl+r", "run"),
                 ("ctrl+s", "save"),
                 ("esc", "commands"),
-                ("ctrl+c", "quit"),
+                ("f1", "help"),
             ])),
         };
 
@@ -645,6 +805,24 @@ impl Editor {
         }
     }
 
+    /// While the Find bar is open, it takes keys and pastes; mouse events still
+    /// reach the panel, so it can be scrolled. Returns `None` for those.
+    fn handle_search(&mut self, event: &Event) -> Option<ScreenAction> {
+        let output = self
+            .output
+            .as_mut()
+            .filter(|output| output.is_searching())?;
+
+        match event {
+            _ if utils::is_ctrl_c(event) => output.close_search(),
+            Event::Key(key) => output.search_key(*key),
+            Event::Paste(text) => output.search_paste(text),
+            _ => return None,
+        }
+
+        Some(ScreenAction::None)
+    }
+
     /// While the output panel has focus, keys and pastes go to the program. Returns
     /// `None` for keys handled like anywhere else (scrolling, run, save, resize).
     fn handle_focused_output(&mut self, event: &Event) -> Option<ScreenAction> {
@@ -669,7 +847,7 @@ impl Editor {
             KeyCode::Enter => output.submit(),
             KeyCode::PageUp | KeyCode::PageDown => return None,
             KeyCode::Up | KeyCode::Down if ctrl || alt => return None,
-            KeyCode::Char('r' | 's') if ctrl => return None,
+            KeyCode::Char('r' | 's' | 'f') if ctrl => return None,
             _ => output.input(*key),
         }
 
@@ -696,9 +874,9 @@ impl Editor {
                 self.command_bar = None;
                 ScreenAction::None
             }
-            CommandEvent::Submit { name, args } => {
+            CommandEvent::Submit { command, args } => {
                 self.command_bar = None;
-                self.execute(name, &args)
+                (command.run)(self, &args)
             }
             CommandEvent::Unknown(name) => {
                 self.command_bar = None;
@@ -782,15 +960,15 @@ impl Editor {
 
         match key.code {
             KeyCode::Esc => self.command_bar = Some(CommandBar::new(COMMANDS)),
+            KeyCode::F(1) => self.help = Some(Help::new(editor_help())),
             KeyCode::Char('o') if ctrl => {
                 if let Some(output) = &mut self.output {
                     output.set_focus(true);
                 }
             }
             KeyCode::Char('r') if ctrl => self.run(),
-            KeyCode::Char('s') if ctrl => {
-                self.save("");
-            }
+            KeyCode::Char('f') if ctrl => self.start_search(""),
+            KeyCode::Char('s') if ctrl => self.save_and_watch(""),
             KeyCode::Up if resize && self.output.is_some() => self.resize_panel(1),
             KeyCode::Down if resize && self.output.is_some() => self.resize_panel(-1),
             KeyCode::PageUp | KeyCode::PageDown if self.output.is_some() => {
@@ -812,6 +990,16 @@ impl Editor {
 }
 
 impl Screen for Editor {
+    /// Ticks only while something changes on its own: a running program, a
+    /// message waiting to disappear, or a draft waiting to be kept.
+    fn tick_rate(&self) -> Option<Duration> {
+        let live = self.output.as_ref().is_some_and(Output::is_live)
+            || self.toast.as_ref().is_some_and(Toast::is_visible)
+            || self.edited.is_some();
+
+        live.then_some(ui::SPINNER_INTERVAL)
+    }
+
     fn update(&mut self) -> Result<ScreenAction> {
         if let Some(output) = &mut self.output {
             output.poll();
@@ -830,7 +1018,12 @@ impl Screen for Editor {
     fn draw(&mut self, frame: &mut Frame) {
         self.screen = frame.area();
 
-        let bottom = if self.command_bar.is_some() { 3 } else { 1 };
+        let searching = self.output.as_ref().is_some_and(Output::is_searching);
+        let bottom = if self.command_bar.is_some() || searching {
+            3
+        } else {
+            1
+        };
         let panel = self.output.as_ref().map(|_| self.panel);
         let (editor_area, output_area, bottom_area) = layout(frame.area(), bottom, panel);
 
@@ -842,9 +1035,10 @@ impl Screen for Editor {
             output.draw(frame, area);
         }
 
-        match &self.command_bar {
-            Some(command_bar) => command_bar.render(frame, bottom_area),
-            None => {
+        match (&self.command_bar, &self.output) {
+            (Some(command_bar), _) => command_bar.render(frame, bottom_area),
+            (None, Some(output)) if searching => output.draw_search(frame, bottom_area),
+            (None, _) => {
                 self.draw_status(frame, bottom_area);
 
                 let output_focused = self.output.as_ref().is_some_and(Output::is_focused);
@@ -862,11 +1056,26 @@ impl Screen for Editor {
         if let Some((_, prompt)) = &self.leaving {
             prompt.render(frame, frame.area());
         }
+
+        if let Some(help) = &mut self.help {
+            help.render(frame, frame.area());
+        }
     }
 
     fn handle(&mut self, event: Event) -> Result<ScreenAction> {
+        if let Some(help) = &mut self.help {
+            if help.handle(&event) {
+                self.help = None;
+            }
+            return Ok(ScreenAction::None);
+        }
+
         if self.leaving.is_some() {
             return Ok(self.handle_prompt(event));
+        }
+
+        if let Some(action) = self.handle_search(&event) {
+            return Ok(action);
         }
 
         if let Some(action) = self.handle_focused_output(&event) {
@@ -898,6 +1107,75 @@ impl Drop for Editor {
 
         // Nothing to report to anymore; a failed write is only noticed next time.
         let _ = self.draft().store(self.runner);
+    }
+}
+
+/// Every key and command in the editor, for the help overlay.
+fn editor_help() -> Vec<HelpSection> {
+    vec![
+        HelpSection::new(
+            "Editor",
+            &[
+                ("ctrl+r", "Run (with the last arguments)"),
+                ("ctrl+s", "Save (and run, when watching)"),
+                ("esc", "Commands"),
+                ("f1", "This help"),
+                ("ctrl+c", "Copy the selection, or quit"),
+                ("ctrl+z / ctrl+y", "Undo / redo"),
+                ("ctrl+x / ctrl+v", "Cut / paste"),
+                ("ctrl+a", "Select everything"),
+                ("ctrl+d", "Duplicate the line"),
+                ("ctrl+k", "Delete the line"),
+                ("tab / shift+tab", "Indent / unindent"),
+            ],
+        ),
+        HelpSection::new(
+            "Output panel",
+            &[
+                ("pgup / pgdn", "Scroll (or use the mouse wheel)"),
+                ("ctrl+↑↓ / alt+↑↓", "Resize (or drag its top border)"),
+                ("ctrl+f", "Find in the output"),
+                ("ctrl+o", "Type input for the program (or click the panel)"),
+            ],
+        ),
+        HelpSection::new(
+            "Typing input (ctrl+o)",
+            &[
+                ("enter", "Send the line"),
+                ("ctrl+d", "End the input"),
+                ("ctrl+c", "Stop the program; again to kill it"),
+                ("esc", "Back to the editor"),
+            ],
+        ),
+        HelpSection::new(
+            "Find (ctrl+f)",
+            &[
+                ("enter / ↓", "Next match"),
+                ("shift+enter / ↑", "Previous match"),
+                ("esc", "Close"),
+            ],
+        ),
+        HelpSection::new(
+            "Command bar (esc)",
+            &[
+                ("tab", "Complete a command or path"),
+                ("↑↓", "Pick a suggestion"),
+                ("enter", "Run"),
+                ("esc", "Close"),
+            ],
+        ),
+        HelpSection::commands(COMMANDS),
+    ]
+}
+
+/// Describes a language's draft for the language screen: its file, or "untitled
+/// draft" when it has changes but no file. `None` when there's nothing to come
+/// back to.
+pub fn draft_label(runner: &'static Runner) -> Option<String> {
+    let draft = Draft::load(runner)?;
+    match draft.path {
+        Some(path) => Some(utils::display_path(&path)),
+        None => (draft.content != runner.template).then(|| "untitled draft".to_string()),
     }
 }
 
@@ -1196,5 +1474,34 @@ mod tests {
             .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL))
             .unwrap();
         assert_eq!(editor.panel.percent, 40);
+    }
+
+    #[test]
+    fn copy_explains_when_there_is_nothing_to_copy() {
+        let mut editor = python_editor();
+        assert!(
+            editor
+                .copy_output("")
+                .unwrap_err()
+                .contains("run the file first")
+        );
+
+        editor.output = Some(Output::failed("x", "y"));
+        assert!(
+            editor
+                .copy_output("abc")
+                .unwrap_err()
+                .contains("number of lines")
+        );
+        assert!(
+            editor
+                .copy_output("0")
+                .unwrap_err()
+                .contains("number of lines")
+        );
+        assert_eq!(
+            editor.copy_output("").unwrap_err(),
+            "There's no output to copy"
+        );
     }
 }

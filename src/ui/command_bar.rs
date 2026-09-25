@@ -9,10 +9,12 @@ use ratatui::{
 
 use super::{ACCENT, Input, InputView, MUTED, SUBTLE, SURFACE, TEXT};
 use crate::utils::PathCompletion;
+use tuimon::ScreenAction;
 
 const MAX_SUGGESTIONS: usize = 6;
 
-pub struct CommandSpec {
+/// A command a screen of type `T` understands.
+pub struct CommandSpec<T: 'static> {
     pub name: &'static str,
     /// Argument hint, e.g. `[path]`. Empty when the command takes none.
     pub args: &'static str,
@@ -21,18 +23,23 @@ pub struct CommandSpec {
     pub keys: &'static str,
     /// Whether the argument is a path, which Tab completes.
     pub paths: bool,
+    /// Runs the command with its arguments (the text after the name).
+    pub run: fn(&mut T, &str) -> ScreenAction,
 }
 
-pub enum CommandEvent {
+pub enum CommandEvent<T: 'static> {
     None,
     Cancel,
-    Submit { name: &'static str, args: String },
+    Submit {
+        command: &'static CommandSpec<T>,
+        args: String,
+    },
     Unknown(String),
 }
 
 /// `:` prompt with fuzzy-prefix suggestions for a screen's commands.
-pub struct CommandBar {
-    specs: &'static [CommandSpec],
+pub struct CommandBar<T: 'static> {
+    specs: &'static [CommandSpec<T>],
     input: Input,
     selected: usize,
     /// Matches for a path being typed, recomputed only when the text changes.
@@ -41,8 +48,8 @@ pub struct CommandBar {
     picked: bool,
 }
 
-impl CommandBar {
-    pub fn new(specs: &'static [CommandSpec]) -> Self {
+impl<T> CommandBar<T> {
+    pub fn new(specs: &'static [CommandSpec<T>]) -> Self {
         Self {
             specs,
             input: Input::default(),
@@ -69,7 +76,7 @@ impl CommandBar {
         }
     }
 
-    fn suggestions(&self) -> Vec<&'static CommandSpec> {
+    fn suggestions(&self) -> Vec<&'static CommandSpec<T>> {
         let (name, _) = self.query();
         let typing_args = self.text().contains(char::is_whitespace);
 
@@ -135,7 +142,7 @@ impl CommandBar {
         }
     }
 
-    fn complete(&mut self, spec: &CommandSpec) {
+    fn complete(&mut self, spec: &CommandSpec<T>) {
         if spec.args.is_empty() {
             self.input.set(spec.name);
         } else {
@@ -150,7 +157,7 @@ impl CommandBar {
     }
 
     /// Keys for a path being typed. Returns `None` to handle the key normally.
-    fn handle_path_key(&mut self, key: KeyEvent) -> Option<CommandEvent> {
+    fn handle_path_key(&mut self, key: KeyEvent) -> Option<CommandEvent<T>> {
         let count = self.paths.as_ref()?.entries.len();
 
         match key.code {
@@ -181,7 +188,7 @@ impl CommandBar {
         Some(CommandEvent::None)
     }
 
-    pub fn handle(&mut self, key: KeyEvent) -> CommandEvent {
+    pub fn handle(&mut self, key: KeyEvent) -> CommandEvent<T> {
         if let Some(event) = self.handle_path_key(key) {
             return event;
         }
@@ -212,8 +219,8 @@ impl CommandBar {
                     .or_else(|| suggestions.get(self.selected).copied());
 
                 return match spec {
-                    Some(spec) => CommandEvent::Submit {
-                        name: spec.name,
+                    Some(command) => CommandEvent::Submit {
+                        command,
                         args: args.to_string(),
                     },
                     None if name.is_empty() => CommandEvent::Cancel,
@@ -365,13 +372,18 @@ mod tests {
 
     use super::*;
 
-    const SPECS: &[CommandSpec] = &[
+    fn nothing(_: &mut (), _: &str) -> ScreenAction {
+        ScreenAction::None
+    }
+
+    const SPECS: &[CommandSpec<()>] = &[
         CommandSpec {
             name: "run",
             args: "",
             description: "",
             keys: "",
             paths: false,
+            run: nothing,
         },
         CommandSpec {
             name: "save",
@@ -379,6 +391,7 @@ mod tests {
             description: "",
             keys: "",
             paths: false,
+            run: nothing,
         },
         CommandSpec {
             name: "back",
@@ -386,6 +399,7 @@ mod tests {
             description: "",
             keys: "",
             paths: false,
+            run: nothing,
         },
         CommandSpec {
             name: "open",
@@ -393,6 +407,7 @@ mod tests {
             description: "",
             keys: "",
             paths: true,
+            run: nothing,
         },
     ];
 
@@ -400,22 +415,22 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn type_text(bar: &mut CommandBar, text: &str) {
+    fn type_text(bar: &mut CommandBar<()>, text: &str) {
         for c in text.chars() {
             bar.handle(key(KeyCode::Char(c)));
         }
     }
 
-    fn submit(text: &str) -> CommandEvent {
+    fn submit(text: &str) -> CommandEvent<()> {
         let mut bar = CommandBar::new(SPECS);
         type_text(&mut bar, text);
         bar.handle(key(KeyCode::Enter))
     }
 
-    fn assert_submits(event: CommandEvent, expected: &str, expected_args: &str) {
+    fn assert_submits(event: CommandEvent<()>, expected: &str, expected_args: &str) {
         match event {
-            CommandEvent::Submit { name, args } => {
-                assert_eq!((name, args.as_str()), (expected, expected_args))
+            CommandEvent::Submit { command, args } => {
+                assert_eq!((command.name, args.as_str()), (expected, expected_args))
             }
             _ => panic!("expected {expected} to be submitted"),
         }
@@ -550,7 +565,7 @@ mod tests {
             }
         }
 
-        fn bar(text: &str) -> CommandBar {
+        fn bar(text: &str) -> CommandBar<()> {
             let mut bar = CommandBar::new(SPECS);
             bar.paste(text);
             bar
@@ -624,7 +639,7 @@ mod tests {
             assert!(bar.paths.is_some());
         }
 
-        fn bar_for_open() -> CommandBar {
+        fn bar_for_open() -> CommandBar<()> {
             bar("open ")
         }
     }

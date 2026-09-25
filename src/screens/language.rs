@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::mpsc::Receiver, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::mpsc::Receiver,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
@@ -13,21 +17,30 @@ use tuimon::{Screen, ScreenAction};
 
 use crate::{
     runners::{self, Detection, RUNNERS, Runner},
-    screens::Editor,
+    screens::{Editor, draft_label},
     ui::{
-        self, ACCENT, CommandBar, CommandEvent, CommandSpec, ERROR, Input, InputView, MUTED,
-        SUBTLE, SUCCESS, SURFACE, TEXT, Toast,
+        self, ACCENT, CommandBar, CommandEvent, CommandSpec, ERROR, Help, HelpSection, Input,
+        InputView, MUTED, SUBTLE, SUCCESS, SURFACE, TEXT, Toast,
     },
     utils,
 };
 
-const COMMANDS: &[CommandSpec] = &[
+const COMMANDS: &[CommandSpec<Language>] = &[
     CommandSpec {
         name: "open",
         args: "<path>",
         description: "Open a file",
         keys: "",
         paths: true,
+        run: Language::command_open,
+    },
+    CommandSpec {
+        name: "help",
+        args: "",
+        description: "Show every key and command",
+        keys: "?",
+        paths: false,
+        run: Language::command_help,
     },
     CommandSpec {
         name: "exit",
@@ -35,6 +48,7 @@ const COMMANDS: &[CommandSpec] = &[
         description: "Quit Scratch",
         keys: "ctrl+c",
         paths: false,
+        run: Language::command_exit,
     },
 ];
 
@@ -51,10 +65,15 @@ pub struct Language {
     detection: Option<Receiver<(usize, Detection)>>,
     started: Instant,
     input: Input,
-    command_bar: Option<CommandBar>,
+    command_bar: Option<CommandBar<Language>>,
     toast: Option<Toast>,
     /// Index into `matches()`.
     selected: usize,
+    /// Each language's draft, as shown in the list.
+    drafts: Vec<Option<String>>,
+    /// Whether `drafts` may be out of date, after an editor was opened.
+    drafts_stale: bool,
+    help: Option<Help>,
 }
 
 impl Language {
@@ -67,6 +86,17 @@ impl Language {
             command_bar: None,
             toast: None,
             selected: 0,
+            drafts: Vec::new(),
+            drafts_stale: true,
+            help: None,
+        }
+    }
+
+    /// Rereads drafts; editors write them when they close.
+    fn refresh_drafts(&mut self) {
+        if self.drafts_stale {
+            self.drafts = RUNNERS.iter().map(draft_label).collect();
+            self.drafts_stale = false;
         }
     }
 
@@ -134,22 +164,31 @@ impl Language {
         // Start from the full list when coming back from the editor.
         self.input.clear();
         self.selected = 0;
+        self.drafts_stale = true;
 
         Ok(ScreenAction::Push(Box::new(editor)))
     }
 
-    fn execute(&mut self, name: &str, args: &str) -> ScreenAction {
-        match name {
-            "open" => match Editor::open(args, None) {
-                Ok(editor) => ScreenAction::Push(Box::new(editor)),
-                Err(err) => {
-                    self.toast = Some(Toast::error(format!("Couldn't open {err}")));
-                    ScreenAction::None
-                }
-            },
-            "exit" => ScreenAction::Quit,
-            _ => ScreenAction::None,
+    fn command_open(&mut self, args: &str) -> ScreenAction {
+        match Editor::open(args, None) {
+            Ok(editor) => {
+                self.drafts_stale = true;
+                ScreenAction::Push(Box::new(editor))
+            }
+            Err(err) => {
+                self.toast = Some(Toast::error(format!("Couldn't open {err}")));
+                ScreenAction::None
+            }
         }
+    }
+
+    fn command_help(&mut self, _: &str) -> ScreenAction {
+        self.help = Some(Help::new(language_help()));
+        ScreenAction::None
+    }
+
+    fn command_exit(&mut self, _: &str) -> ScreenAction {
+        ScreenAction::Quit
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
@@ -182,11 +221,27 @@ impl Language {
             .max()
             .unwrap_or(0);
 
+        // A column for drafts, only when there are any.
+        let draft_width = self
+            .drafts
+            .iter()
+            .flatten()
+            .map(|label| label.chars().count() + 2)
+            .max()
+            .unwrap_or(0)
+            .min(28);
+
+        // What's left for each program's path: the highlight, icon, name and draft
+        // columns come first.
+        let draft_columns = if draft_width > 0 { draft_width + 2 } else { 0 };
+        let path_width = usize::from(area.width).saturating_sub(3 + name_width + 4 + draft_columns);
+
         let items: Vec<ListItem> = visible
             .iter()
             .map(|&index| {
                 let runner = &RUNNERS[index];
                 let name = format!(" {:name_width$}   ", runner.name);
+                let draft = self.draft_column(index, draft_width);
 
                 let line = match &self.statuses[index] {
                     Status::Checking => Line::from(vec![
@@ -194,11 +249,20 @@ impl Language {
                         Span::styled(name, Style::new().fg(SUBTLE)),
                         Span::styled("checking…", Style::new().fg(MUTED).italic()),
                     ]),
-                    Status::Available(binary) => Line::from(vec![
-                        Span::styled("✓", Style::new().fg(SUCCESS)),
-                        Span::styled(name, Style::new().fg(TEXT).bold()),
-                        Span::styled(binary.display().to_string(), Style::new().fg(MUTED)),
-                    ]),
+                    Status::Available(binary) => Line::from(
+                        [
+                            vec![
+                                Span::styled("✓", Style::new().fg(SUCCESS)),
+                                Span::styled(name, Style::new().fg(TEXT).bold()),
+                            ],
+                            draft,
+                            vec![Span::styled(
+                                utils::truncate_start(&utils::display_path(binary), path_width),
+                                Style::new().fg(MUTED),
+                            )],
+                        ]
+                        .concat(),
+                    ),
                     Status::Unavailable(reason) => Line::from(vec![
                         Span::styled("✗", Style::new().fg(ERROR).dim()),
                         Span::styled(name, Style::new().fg(MUTED)),
@@ -220,6 +284,27 @@ impl Language {
 
         let mut state = ListState::default().with_selected(position);
         frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    /// The draft column for runner `index`, padded to `width` (empty when there's
+    /// no column).
+    fn draft_column(&self, index: usize, width: usize) -> Vec<Span<'static>> {
+        if width == 0 {
+            return Vec::new();
+        }
+
+        match self.drafts.get(index).cloned().flatten() {
+            Some(label) => {
+                let label = utils::truncate_start(&label, width - 2);
+                let padding = width - label.chars().count();
+                vec![
+                    Span::styled("● ", Style::new().fg(ACCENT)),
+                    Span::styled(label, Style::new().fg(SUBTLE)),
+                    Span::raw(" ".repeat(padding)),
+                ]
+            }
+            None => vec![Span::raw(" ".repeat(width + 2))],
+        }
     }
 
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
@@ -271,12 +356,32 @@ impl Language {
                 ("↑↓", "navigate"),
                 ("enter", "open"),
                 (":", "commands"),
+                ("?", "help"),
                 ("ctrl+c", "quit"),
             ])),
         };
 
         frame.render_widget(Paragraph::new(line), area);
     }
+}
+
+/// Every key and command on the language screen, for the help overlay.
+fn language_help() -> Vec<HelpSection> {
+    vec![
+        HelpSection::new(
+            "Language screen",
+            &[
+                ("↑↓", "Move through the languages"),
+                ("enter", "Open the highlighted language"),
+                ("type", "Filter the list"),
+                ("esc", "Clear the filter"),
+                (":", "Commands"),
+                ("? / f1", "This help"),
+                ("ctrl+c", "Quit"),
+            ],
+        ),
+        HelpSection::commands(COMMANDS),
+    ]
 }
 
 /// How well `name` matches `query`, case-insensitively: 0 exact, 1 prefix,
@@ -297,12 +402,20 @@ fn rank(name: &str, query: &str) -> Option<u8> {
 }
 
 impl Screen for Language {
+    /// Ticks only while languages are being checked or a message is showing.
+    fn tick_rate(&self) -> Option<Duration> {
+        let live = self.checking() || self.toast.as_ref().is_some_and(Toast::is_visible);
+        live.then_some(ui::SPINNER_INTERVAL)
+    }
+
     fn update(&mut self) -> Result<ScreenAction> {
         self.poll_detection();
         Ok(ScreenAction::None)
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        self.refresh_drafts();
+
         let matches = self.matches().len();
         self.selected = self.selected.min(matches.saturating_sub(1));
 
@@ -321,11 +434,31 @@ impl Screen for Language {
 
         let footer = footer.inner(ratatui::layout::Margin::new(1, 0));
         self.draw_footer(frame, footer);
+
+        if let Some(help) = &mut self.help {
+            help.render(frame, frame.area());
+        }
     }
 
     fn handle(&mut self, event: Event) -> Result<ScreenAction> {
+        if let Some(help) = &mut self.help {
+            if help.handle(&event) {
+                self.help = None;
+            }
+            return Ok(ScreenAction::None);
+        }
+
         if let Some(action) = utils::handle_exit_input(&event) {
             return Ok(action);
+        }
+
+        // `?` never appears in a language name, so it always means help.
+        if self.command_bar.is_none()
+            && let Event::Key(key) = &event
+            && matches!(key.code, KeyCode::Char('?') | KeyCode::F(1))
+        {
+            self.help = Some(Help::new(language_help()));
+            return Ok(ScreenAction::None);
         }
 
         // Results may have arrived since the last draw.
@@ -361,9 +494,9 @@ impl Screen for Language {
                     self.command_bar = None;
                     ScreenAction::None
                 }
-                CommandEvent::Submit { name, args } => {
+                CommandEvent::Submit { command, args } => {
                     self.command_bar = None;
-                    self.execute(name, &args)
+                    (command.run)(self, &args)
                 }
                 CommandEvent::Unknown(name) => {
                     self.command_bar = None;
